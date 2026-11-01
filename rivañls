@@ -1,0 +1,4280 @@
+local env = (getgenv and getgenv()) or _G
+
+-- Si ya está corriendo, no hace nada (ni foto ni sonido)
+if env.CeboIntroActivo then return end
+env.CeboIntroActivo = true
+
+local ok, err = pcall(function()
+	local TweenService = game:GetService("TweenService")
+	local getAsset = getcustomasset or getsynasset
+
+	local imgUrl = "https://files.catbox.moe/pm6msk.png"
+	local sndUrl = "https://files.catbox.moe/3tmf88.mp3"
+	local imgFile, sndFile = "centro_img.png", "centro_snd.mp3"
+
+	-- Solo descarga si el archivo no existe
+	local pending = 0
+	local function download(url, file)
+		if isfile(file) then return end
+		pending += 1
+		task.spawn(function()
+			writefile(file, game:HttpGet(url))
+			pending -= 1
+		end)
+	end
+	download(imgUrl, imgFile)
+	download(sndUrl, sndFile)
+	while pending > 0 do task.wait() end
+
+	-- PC (teclado o pantalla grande) = más grande; celular = tamaño normal
+	local UIS = game:GetService("UserInputService")
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+	local isPC = UIS.KeyboardEnabled or vp.X >= 1000
+	local SIZE = isPC and 320 or 200 -- cambia los tamaños aquí
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "ImagenCentro"
+	gui.IgnoreGuiInset = true
+	gui.ResetOnSpawn = false
+
+	local img = Instance.new("ImageLabel")
+	img.AnchorPoint = Vector2.new(0.5, 0.5)
+	img.Position = UDim2.fromScale(0.5, 0.5)
+	img.Size = UDim2.fromOffset(SIZE * 0.7, SIZE * 0.7)
+	img.BackgroundTransparency = 1
+	img.BorderSizePixel = 0
+	img.Image = getAsset(imgFile)
+	img.ImageTransparency = 1
+	img.ScaleType = Enum.ScaleType.Fit
+	img.Parent = gui
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = getAsset(sndFile)
+	sound.Volume = 1
+	sound.Parent = game:GetService("SoundService")
+
+	gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+	sound:Play()
+
+	-- Entrada suave
+	TweenService:Create(img, TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+		ImageTransparency = 0,
+		Size = UDim2.fromOffset(SIZE, SIZE),
+	}):Play()
+
+	-- Mantiene la imagen y luego salida suave
+	task.wait(1.6)
+	local out = TweenService:Create(img, TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {
+		ImageTransparency = 1,
+		Size = UDim2.fromOffset(SIZE * 0.7, SIZE * 0.7),
+	})
+	out:Play()
+	out.Completed:Wait()
+	gui:Destroy()
+
+	sound.Ended:Connect(function()
+		sound:Destroy()
+	end)
+	if not sound.IsPlaying then sound:Destroy() end
+end)
+
+-- Se libera al terminar la animación (o si hubo un error), para poder ejecutarlo otra vez
+env.CeboIntroActivo = false
+if not ok then warn("Error en la intro:", err) end
+repeat
+	task.wait()
+until game:IsLoaded()
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+local TeleportService = game:GetService("TeleportService")
+local Workspace = game:GetService("Workspace")
+local StarterGui = game:GetService("StarterGui")
+local TextService = game:GetService("TextService")
+local localPlayer = Players.LocalPlayer
+
+local result = nil
+if type(gethui) == "function" then
+	local ok, res = pcall(gethui)
+	if ok and res then result = res end
+end
+if not result then
+	local ok, res = pcall(function() return game:GetService("CoreGui") end)
+	if ok and res then result = res end
+end
+result = result or localPlayer:WaitForChild("PlayerGui")
+
+for _, v in ipairs({"CeboFinder_UI", "CeboFinder_Main", "CeboFinder_Notifs", "AnnouncementGui", "CeboFinder", "CeboEggFinder"}) do
+	local old = result:FindFirstChild(v)
+	if old then old:Destroy() end
+end
+
+local viewportSize = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
+local touchEnabled = UserInputService.TouchEnabled
+local scaleFactor = touchEnabled and 0.85 or 1
+
+----------------------------------------------------------------
+-- Firebase Egg API
+----------------------------------------------------------------
+local FIREBASE = "https://websockers-default-rtdb.firebaseio.com"
+local FEED_SECRET = "NXkp769Ck8WwGOOwWcw4vQl5569WcvnzzgRO1ojV"
+local POLL = 0.5
+local STALE_SEC = 300  -- 5 min: eggs reaparecen ~cada 5 min
+local requestFn = (syn and syn.request) or (http and http.request) or http_request or request
+
+----------------------------------------------------------------
+-- ACCESO (el acceso lo controla Luarmor)
+----------------------------------------------------------------
+local access = {
+	owner = false,
+	unlocked = true,
+	status = "allowed",
+	perms = { admin = false, autojoin = true },
+}
+access.PLACE_ID = 107778070777162 -- el Finder SOLO muestra logs de este juego
+access.staffActive = function() return false end
+access.staffCan = function(p) return false end
+access.staffAny = function() return false end
+access.canWL = function() return false end
+access.canUsers = function() return false end
+access.canCebo = function() return false end
+
+local function hasPerm(p)
+	return access.perms[p] == true
+end
+
+local denyNotifyFn = function() end   -- se asigna cuando existe la UI
+
+local config = {
+	autoJoin = false,
+	autoForce = false,
+	forceTime = 10,
+	threshold = "500M",
+	connected = false,
+	logSoundId = "125621644257669",
+	logSoundEnabled = true,
+	cleanTimes = 2,        -- Respawn Avatar [#]  (0 = desactivado)
+	adminRejoin = false,   -- Admin Panel V2 (maximo 2 opciones activas a la vez)
+	adminKick = false,
+	adminHop = false,
+	hopSpam = false,
+	hopFilterOne = true,
+	logNotify = false,     -- Log Notifications (pop-up con foto del pet; click = JOIN)
+	viewCebo = true,       -- Owner: ver banner + highlight de scanners (Settings)
+	autoExec = false,      -- Auto Execute Finder tras cada teleport (se guarda)
+	filterMut = {},        -- Filtro de mutacion: set de claves (vacio = ALL)
+	filterPlayers = {},    -- Filtro de jugadores: set de numeros 1..7 (vacio = ALL)
+	minAutoJoin = 0,       -- Minimo Auto-Join  (NO se guarda: arranca vacio al ejecutar)
+	minAutoForce = 0,      -- Minimo Auto-Force (NO se guarda: arranca vacio al ejecutar)
+}
+
+local function normalize(str)
+	return (tostring(str or ""):lower():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function loadConfig()
+	if not readfile or not isfile then return end
+	if not isfile("CeboFinder_Config.json") then return end
+	pcall(function()
+		local data = HttpService:JSONDecode(readfile("CeboFinder_Config.json"))
+		if type(data.forceTime) == "number" then config.forceTime = data.forceTime end
+		if type(data.threshold) == "string" then config.threshold = data.threshold end
+		if type(data.logSoundId) == "string" and data.logSoundId ~= "" then config.logSoundId = data.logSoundId end
+		if type(data.logSoundEnabled) == "boolean" then config.logSoundEnabled = data.logSoundEnabled end
+		if type(data.cleanTimes) == "number" then config.cleanTimes = math.clamp(math.floor(data.cleanTimes), 0, 10) end
+		if type(data.adminRejoin) == "boolean" then config.adminRejoin = data.adminRejoin end
+		if type(data.adminKick) == "boolean" then config.adminKick = data.adminKick end
+		if type(data.adminHop) == "boolean" then config.adminHop = data.adminHop end
+		-- Limite: maximo 1 opcion activa (respawn cuenta como una)
+		local n = ((tonumber(config.cleanTimes) or 0) > 0 and 1 or 0)
+		for _, k in ipairs({ "adminRejoin", "adminKick", "adminHop" }) do
+			if config[k] then
+				n += 1
+				if n > 1 then config[k] = false end
+			end
+		end
+		if type(data.hopSpam) == "boolean" then config.hopSpam = data.hopSpam end
+		if type(data.hopFilterOne) == "boolean" then config.hopFilterOne = data.hopFilterOne end
+		if type(data.logNotify) == "boolean" then config.logNotify = data.logNotify end
+		if type(data.viewCebo) == "boolean" then config.viewCebo = data.viewCebo end
+		if type(data.autoExec) == "boolean" then config.autoExec = data.autoExec end
+		if type(data.filterMut) == "table" then
+			config.filterMut = {}
+			for _, k in ipairs(data.filterMut) do
+				if type(k) == "string" and k ~= "" then config.filterMut[k] = true end
+			end
+		end
+		if type(data.filterPlayers) == "table" then
+			config.filterPlayers = {}
+			for _, n in ipairs(data.filterPlayers) do
+				if type(n) == "number" then config.filterPlayers[n] = true end
+			end
+		end
+	end)
+end
+
+local function saveConfig()
+	if not writefile then return end
+	pcall(function()
+		writefile("CeboFinder_Config.json", HttpService:JSONEncode({
+			forceTime = config.forceTime,
+			threshold = config.threshold,
+			logSoundId = config.logSoundId,
+			logSoundEnabled = config.logSoundEnabled,
+			cleanTimes = config.cleanTimes,
+			adminRejoin = config.adminRejoin,
+			adminKick = config.adminKick,
+			adminHop = config.adminHop,
+			hopSpam = config.hopSpam,
+			hopFilterOne = config.hopFilterOne,
+			logNotify = config.logNotify,
+			viewCebo = config.viewCebo,
+			autoExec = config.autoExec,
+			filterMut = (function() local t = {} for k in pairs(config.filterMut) do t[#t + 1] = k end return t end)(),
+			filterPlayers = (function() local t = {} for n in pairs(config.filterPlayers) do t[#t + 1] = n end table.sort(t) return t end)(),
+		}))
+	end)
+end
+
+loadConfig()
+
+local state = {
+	tab = nil,
+	detected = 0,
+	history = {},
+}
+
+local usersData = {} -- scanners online (se llena en fetchUsers)
+local updateTags     -- forward decl (se define mas abajo; Settings la usa)
+
+local WHITE = Color3.fromRGB(255, 255, 255)
+local SILVER = Color3.fromRGB(150, 150, 156)
+local STEEL = Color3.fromRGB(70, 70, 76)
+local BG_MAIN = Color3.fromRGB(10, 10, 10)
+local BG_INPUT = Color3.fromRGB(30, 30, 30)
+local BG_ROW = Color3.fromRGB(18, 18, 18)
+local BG_CHIP_OFF = Color3.fromRGB(22, 22, 22)
+local BG_CHIP_ON = Color3.fromRGB(38, 38, 38)
+
+local FONT_TITLE = Enum.Font.GothamBlack
+local FONT_LABEL = Enum.Font.GothamBold
+local FONT_VALUE = Enum.Font.GothamMedium
+local FONT_STATUS = Enum.Font.Gotham
+
+local living = {}
+
+local function bands(a, b)
+	return ColorSequence.new({
+		ColorSequenceKeypoint.new(0, a),
+		ColorSequenceKeypoint.new(0.25, b),
+		ColorSequenceKeypoint.new(0.5, a),
+		ColorSequenceKeypoint.new(0.75, b),
+		ColorSequenceKeypoint.new(1, a),
+	})
+end
+
+local function livingStroke(parent, thickness, bright)
+	local s = Instance.new("UIStroke")
+	s.Thickness = thickness or 1
+	s.Color = WHITE
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = parent
+	local g = Instance.new("UIGradient")
+	g.Rotation = 45
+	g.Color = bands(bright and WHITE or SILVER, STEEL)
+	g.Parent = s
+	table.insert(living, g)
+	return s, g
+end
+
+-- Stroke estatico (sin gradient animado) para logs: cero lag
+local function staticStroke(parent, thickness)
+	local s = Instance.new("UIStroke")
+	s.Thickness = thickness or 1
+	s.Color = SILVER
+	s.Transparency = 0.35
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = parent
+	return s
+end
+
+local function livingText(label)
+	local g = Instance.new("UIGradient")
+	g.Color = bands(WHITE, SILVER)
+	g.Parent = label
+	table.insert(living, g)
+	return g
+end
+
+local function corner(parent, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius)
+	c.Parent = parent
+	return c
+end
+
+-- Necesario para Status (glass effect en paneles)
+local function glass(parent, strength)
+	local k = strength or 0.10
+	local hi = math.min(1 + k * 0.55, 1)
+	local lo = 1 - k
+	local g = Instance.new("UIGradient")
+	g.Rotation = 90
+	g.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.new(hi, hi, hi)),
+		ColorSequenceKeypoint.new(0.45, Color3.new(1, 1, 1)),
+		ColorSequenceKeypoint.new(1, Color3.new(lo, lo, lo)),
+	})
+	g.Parent = parent
+	return g
+end
+
+local rotation = 0
+local tickCount = 0
+-- Gradients solo UI fija. Logs/History = staticStroke (0 costo en este loop).
+RunService.Heartbeat:Connect(function(dt)
+	tickCount += 1
+	if tickCount % 15 ~= 0 then return end -- ~0.25s
+	rotation = (rotation + dt * 40) % 360
+	local maxG = math.min(#living, 20)
+	for i = #living, 1, -1 do
+		local g = living[i]
+		if not g or not g.Parent then
+			table.remove(living, i)
+		elseif i <= maxG then
+			g.Rotation = g.Parent:IsA("UIStroke") and (45 + rotation) % 360 or rotation
+		end
+	end
+end)
+
+local function create(class, props)
+	local inst = Instance.new(class)
+	for k, v in pairs(props or {}) do
+		if k ~= "Parent" then
+			inst[k] = v
+		end
+	end
+	if class == "UIStroke" then
+		pcall(function() inst.ApplyStrokeMode = Enum.ApplyStrokeMode.Border end)
+	end
+	if (class == "TextLabel" or class == "TextButton" or class == "TextBox") then
+		pcall(function() inst.LineHeight = 1.1 end)
+	end
+	if props and props.Parent then
+		inst.Parent = props.Parent
+	end
+	return inst
+end
+
+local function tween(obj, props, duration, style, dir)
+	if not obj or not obj.Parent then return end
+	pcall(function()
+		TweenService:Create(obj, TweenInfo.new(duration or 0.35, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), props):Play()
+	end)
+end
+
+local function popButton(btn)
+	if not btn or not btn.Parent then return end
+	local sc = btn:FindFirstChild("PopScale")
+	if not sc then
+		sc = Instance.new("UIScale")
+		sc.Name = "PopScale"
+		sc.Parent = btn
+	end
+	sc.Scale = 0.88
+	tween(sc, { Scale = 1 }, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+end
+
+local soundCount = 0
+local function playSound(id, volume, speed)
+	if soundCount >= 6 then return end
+	soundCount += 1
+	task.spawn(function()
+		pcall(function()
+			local s = Instance.new("Sound")
+			s.SoundId = "rbxassetid://" .. tostring(id)
+			s.Volume = volume or 1
+			s.PlaybackSpeed = speed or 1
+			s.Parent = game:GetService("SoundService")
+			s:Play()
+			s.Ended:Wait()
+			s:Destroy()
+		end)
+		soundCount -= 1
+	end)
+end
+
+local function valueColor(mps, isOg)
+	local n = tonumber(mps) or 0
+	if n >= 1e9 then return WHITE end
+	if n >= 100000000 then return SILVER end
+	return STEEL
+end
+
+local function parseValue(str)
+	if not str then return 0 end
+	local s = tostring(str):gsub("%s+", ""):lower()
+	local n = tonumber(s:match("[%d%.]+")) or 0
+	if s:find("q") then return n * 1e15 end
+	if s:find("t") then return n * 1e12 end
+	if s:find("b") then return n * 1e9 end
+	if s:find("m") then return n * 1e6 end
+	if s:find("k") then return n * 1e3 end
+	return n
+end
+
+local function formatValue(n)
+	n = tonumber(n) or 0
+	local function fmt(v, s) return string.format("$%.1f%s/s", v, s):gsub("%.0", "") end
+	if n >= 1e15 then return fmt(n / 1e15, "Q") end
+	if n >= 1e12 then return fmt(n / 1e12, "T") end
+	if n >= 1e9 then return fmt(n / 1e9, "B") end
+	if n >= 1e6 then return fmt(n / 1e6, "M") end
+	if n >= 1e3 then return fmt(n / 1e3, "K") end
+	return "$" .. tostring(math.floor(n)) .. "/s"
+end
+
+-- Contenedor de utilidades nuevas (evita pasar el limite de variables locales)
+local CX = {}
+CX.ignored = {}      -- eggUid -> timestamp (borrados por Clear / purga: no deben volver)
+CX.IGNORE_SEC = 330
+CX.lastFresh = {}    -- ultimo snapshot de Firebase (uid -> entry)
+CX.lastFbKeys = {}   -- uid -> clave real en Firebase
+
+CX.isIgnored = function(uid)
+	local t = CX.ignored[uid]
+	if not t then return false end
+	if os.time() - t > CX.IGNORE_SEC then
+		CX.ignored[uid] = nil
+		return false
+	end
+	return true
+end
+
+-- Texto de mutacion + efecto (ej: "Divine • Rainbow")
+CX.mutDisplay = function(data)
+	local mut = (data.mutation and data.mutation ~= "" and data.mutation ~= "—") and tostring(data.mutation) or ""
+	local eff = data.effect and tostring(data.effect) or ""
+	local rar = data.rarityName and tostring(data.rarityName) or ""
+	if eff ~= "" then
+		if rar == "" or rar == eff then return eff end
+		return rar .. " • " .. eff
+	end
+	return mut
+end
+
+-- Filtros de Settings: mutacion + jugadores del servidor
+CX.passesFilters = function(entry)
+	local fm = config.filterMut
+	if fm and next(fm) ~= nil then
+		local hay = (tostring(entry.rarityName or "") .. "|" .. tostring(entry.mutation or "")):lower()
+		local okm = false
+		for key in pairs(fm) do
+			if hay:find(key, 1, true) then okm = true break end
+		end
+		if not okm then return false end
+	end
+	local fp = config.filterPlayers
+	if fp and next(fp) ~= nil then
+		local p = tonumber(entry.players)
+		if not p or not fp[p] then return false end
+	end
+	return true
+end
+
+local function meetsThreshold(entry)
+	if not entry then return false end
+	return (tonumber(entry.mps) or 0) >= math.max(parseValue(config.threshold), 250000000) and CX.passesFilters(entry)
+end
+if parseValue(config.threshold) < 250000000 then config.threshold = "250M" end
+
+local function now()
+	return os.date("%H:%M:%S")
+end
+
+-- Tiempo desde el spawn del Pet en formato m:ss
+local function spawnAge(ts)
+	local d = math.max(0, os.time() - (tonumber(ts) or os.time()))
+	return string.format("%d:%02d", math.floor(d / 60), d % 60)
+end
+
+-- Parte ESTÁTICA del sub (sin edad): no cambia cada segundo → no reescribir texto en masa
+local function subStatic(data)
+	local maxP = tonumber(data.maxPlayers)
+	local cur = tonumber(data.players)
+	local s = (maxP and tostring(maxP) or "?") .. "/" .. (cur and tostring(cur) or "?")
+	local md = CX.mutDisplay(data)
+	if md ~= "" then
+		s = s .. " • " .. md
+	end
+	if data.og then s = s .. " • OG" end
+	return s
+end
+
+-- Texto completo (solo al crear / cuando cambia players-mutación)
+local function subText(data)
+	if data.spawnedAt then
+		return subStatic(data) .. " • " .. spawnAge(data.spawnedAt)
+	end
+	return subStatic(data)
+end
+
+-- Pinta sub de 1 fila: jugadores + edad (barato). Nunca en masa.
+local function paintAgeOnly(ui)
+	if not ui or not ui.sub or not ui.data then return end
+	local base = ui._staticSub
+	if not base then
+		base = subStatic(ui.data)
+		ui._staticSub = base
+	end
+	if ui.data.spawnedAt then
+		ui.sub.Text = base .. " • " .. spawnAge(ui.data.spawnedAt)
+	else
+		ui.sub.Text = base
+	end
+end
+
+----------------------------------------------------------------
+-- HTTP helpers (Firebase)
+-- print=silent: Firebase responde 204 vacio (mucho mas rapido) en escrituras
+----------------------------------------------------------------
+local function silentUrl(url)
+	if url:find("print=silent", 1, true) then return url end
+	return url .. (url:find("?", 1, true) and "&" or "?") .. "print=silent"
+end
+
+local function httpGet(path)
+	local url = FIREBASE .. path
+	local body
+	local ok = pcall(function()
+		if requestFn then
+			local res = requestFn({
+				Url = url,
+				Method = "GET",
+				Headers = { ["Content-Type"] = "application/json" },
+			})
+			body = res and res.Body
+		else
+			body = game:HttpGet(url)
+		end
+	end)
+	if not ok then return nil end
+	return body
+end
+
+local function httpPut(path, tbl)
+	local url = silentUrl(FIREBASE .. path)
+	pcall(function()
+		if requestFn then
+			requestFn({
+				Url = url,
+				Method = "PUT",
+				Headers = { ["Content-Type"] = "application/json" },
+				Body = HttpService:JSONEncode(tbl),
+			})
+		end
+	end)
+end
+
+-- Envia PUT/PATCH y devuelve (ok, statusCode)
+local function httpSend(method, path, tbl)
+	if not requestFn then return false, 0 end
+	local ok, res = pcall(function()
+		return requestFn({
+			Url = silentUrl(FIREBASE .. path),
+			Method = method,
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = (HttpService:JSONEncode(tbl):gsub("\"__NULL__\"", "null")),
+		})
+	end)
+	if not ok or not res then return false, 0 end
+	local code = tonumber(res.StatusCode or res.Status or res.statusCode or 0) or 0
+	return (code == 0 or (code >= 200 and code < 300)), code
+end
+
+-- DELETE de claves de /eggs (en paralelo, sin bloquear)
+CX.del = function(keys)
+	if not requestFn or not keys or #keys == 0 then return end
+	task.spawn(function()
+		for i, k in ipairs(keys) do
+			task.spawn(function()
+				pcall(function()
+					requestFn({
+						Url = silentUrl(FIREBASE .. "/eggs/" .. tostring(k) .. ".json"),
+						Method = "DELETE",
+						Headers = { ["Content-Type"] = "application/json" },
+					})
+				end)
+			end)
+			if i % 8 == 0 then task.wait(0.1) end
+		end
+	end)
+end
+
+local function canJoin()
+	if hasPerm("autojoin") then return true end
+	pcall(denyNotifyFn, "Auto Joiners")
+	return false
+end
+
+-- Teleport soporta placeId (Firebase) o game.PlaceId
+local function teleport(jobId, placeId)
+	if not jobId or jobId == "" or jobId == "0" then return end
+	if not canJoin() then return end
+	local pid = tonumber(placeId) or game.PlaceId
+	pcall(function()
+		TeleportService:TeleportToPlaceInstance(pid, tostring(jobId), localPlayer)
+	end)
+end
+
+local function forceTeleport(jobId, duration, placeId)
+	if not jobId or jobId == "" or jobId == "0" then return end
+	if not canJoin() then return end
+	local pid = tonumber(placeId) or game.PlaceId
+	local untilTime = os.clock() + (duration or config.forceTime or 10)
+	task.spawn(function()
+		while os.clock() < untilTime do
+			if not hasPerm("autojoin") then break end
+			pcall(function()
+				TeleportService:TeleportToPlaceInstance(pid, tostring(jobId), localPlayer)
+			end)
+			task.wait(2.5)
+		end
+	end)
+end
+
+
+----------------------------------------------------------------
+-- UI
+----------------------------------------------------------------
+local ScreenGui = create("ScreenGui", {
+	Name = "CeboFinder_UI",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	Parent = result,
+})
+
+local mainSize = touchEnabled and UDim2.new(0, 580, 0, 360) or UDim2.new(0, 800, 0, 500)
+local Main = create("Frame", {
+	Name = "Main",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.new(0.5, 0, 0.5, 0),
+	Size = mainSize,
+	BackgroundColor3 = BG_MAIN,
+	BackgroundTransparency = 0,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+	ZIndex = 1,
+	Parent = ScreenGui,
+})
+corner(Main, 12)
+local UIScale = create("UIScale", { Scale = scaleFactor, Parent = Main })
+livingStroke(Main, 1.5, true)
+
+local glow1 = create("ImageLabel", {
+	Size = UDim2.new(1.5, 0, 1.5, 0),
+	Position = UDim2.new(-0.25, 0, -0.25, 0),
+	BackgroundTransparency = 1,
+	Image = "rbxassetid://12224031644",
+	ImageColor3 = WHITE,
+	ImageTransparency = 1,
+	ZIndex = 1,
+	Parent = Main,
+})
+local glow2 = create("ImageLabel", {
+	Size = UDim2.new(1.2, 0, 1.2, 0),
+	Position = UDim2.new(0.1, 0, 0.1, 0),
+	BackgroundTransparency = 1,
+	Image = "rbxassetid://12224031644",
+	ImageColor3 = SILVER,
+	ImageTransparency = 1,
+	ZIndex = 1,
+	Parent = Main,
+})
+-- Glow: cada ~0.25s (no cada frame = menos CPU idle)
+task.spawn(function()
+	local rot = 0
+	while Main and Main.Parent do
+		rot = (rot + 0.75) % 360
+		if glow1 then glow1.Rotation = rot end
+		if glow2 then glow2.Rotation = -rot * 0.7 end
+		task.wait(0.25)
+	end
+end)
+
+-- Holograma de fondo: anillos concentricos que se encogen hacia el centro (muy sutil, detras de todo)
+do
+	local RING_COUNT = 4
+	local RING_TIME = 8
+	local RING_START = touchEnabled and 560 or 780
+	for i = 1, RING_COUNT do
+		local ring = create("Frame", {
+			Name = "HoloRing",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, 0),
+			Size = UDim2.new(0, RING_START, 0, RING_START),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ZIndex = 1,
+			Parent = Main,
+		})
+		create("UICorner", { CornerRadius = UDim.new(1, 0), Parent = ring })
+		local ringStroke = create("UIStroke", {
+			Thickness = 1.5,
+			Color = SILVER,
+			Transparency = 1,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Parent = ring,
+		})
+		task.spawn(function()
+			task.wait((i - 1) * (RING_TIME / RING_COUNT))
+			while ring and ring.Parent do
+				ring.Size = UDim2.new(0, RING_START, 0, RING_START)
+				ringStroke.Transparency = 1
+				tween(ring, { Size = UDim2.new(0, 0, 0, 0) }, RING_TIME, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+				tween(ringStroke, { Transparency = 0.86 }, RING_TIME * 0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+				task.wait(RING_TIME * 0.3)
+				tween(ringStroke, { Transparency = 1 }, RING_TIME * 0.7, Enum.EasingStyle.Sine, Enum.EasingDirection.In)
+				task.wait(RING_TIME * 0.7)
+			end
+		end)
+	end
+end
+
+local sideW = touchEnabled and 120 or 160
+local Sidebar = create("Frame", {
+	Size = UDim2.new(0, sideW, 1, 0),
+	BackgroundColor3 = BG_MAIN,
+	BackgroundTransparency = 0.15,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+	Parent = Main,
+})
+corner(Sidebar, 12)
+create("Frame", {
+	Size = UDim2.new(0, 28, 1, 0),
+	Position = UDim2.new(1, -28, 0, 0),
+	BackgroundColor3 = BG_MAIN,
+	BackgroundTransparency = 0.15,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+	Parent = Sidebar,
+})
+local sideLine = create("Frame", {
+	Size = UDim2.new(0, 1, 0.9, 0),
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(1, 0, 0.5, 0),
+	BackgroundColor3 = WHITE,
+	BackgroundTransparency = 0.7,
+	BorderSizePixel = 0,
+	ZIndex = 3,
+	Parent = Sidebar,
+})
+corner(sideLine, 1)
+
+local Content = create("Frame", {
+	Size = UDim2.new(1, -(sideW + 4), 1, 0),
+	Position = UDim2.new(0, sideW + 4, 0, 0),
+	BackgroundTransparency = 1,
+	ZIndex = 2,
+	Parent = Main,
+})
+
+local header = create("Frame", { Size = UDim2.new(1, 0, 0, 60), BackgroundTransparency = 1, ZIndex = 3, Parent = Sidebar })
+create("ImageLabel", {
+	Name = "TitleIcon",
+	Size = UDim2.new(0, 16, 0, 16),
+	Position = UDim2.new(0, 14, 0, 13),
+	BackgroundTransparency = 1,
+	Image = "rbxassetid://87563802520297",
+	ImageColor3 = WHITE,
+	ScaleType = Enum.ScaleType.Fit,
+	ZIndex = 4,
+	Parent = header,
+})
+local brandTitle = create("TextLabel", {
+	Size = UDim2.new(1, -42, 0, 22),
+	Position = UDim2.new(0, 36, 0, 10),
+	BackgroundTransparency = 1,
+	Text = "CeboFinder",
+	TextColor3 = WHITE,
+	TextSize = 16,
+	Font = FONT_TITLE,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 4,
+	Parent = header,
+})
+livingText(brandTitle)
+
+local statusDot = create("Frame", {
+	Size = UDim2.new(0, 6, 0, 6),
+	Position = UDim2.new(0, 16, 0, 44),
+	BackgroundColor3 = STEEL,
+	BorderSizePixel = 0,
+	ZIndex = 4,
+	Parent = header,
+})
+corner(statusDot, 1)
+local statusText = create("TextLabel", {
+	Size = UDim2.new(1, -30, 0, 16),
+	Position = UDim2.new(0, 28, 0, 39),
+	BackgroundTransparency = 1,
+	Text = "Offline",
+	TextColor3 = STEEL,
+	TextSize = 11,
+	Font = FONT_STATUS,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 4,
+	Parent = header,
+})
+
+local function setStatus(connected, msg)
+	config.connected = connected
+	local text = msg or (connected and "Connected" or "Offline")
+	local col = connected and WHITE or STEEL
+	tween(statusDot, { BackgroundColor3 = col })
+	tween(statusText, { TextColor3 = col })
+	statusText.Text = text
+end
+
+local tabList = create("Frame", {
+	Size = UDim2.new(1, 0, 1, -120),
+	Position = UDim2.new(0, 0, 0, 70),
+	BackgroundTransparency = 1,
+	ZIndex = 3,
+	Parent = Sidebar,
+})
+create("UIListLayout", { Padding = UDim.new(0, 4), HorizontalAlignment = Enum.HorizontalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder, Parent = tabList })
+
+local tabIndicator = create("Frame", {
+	Size = UDim2.new(1, -16, 0, 36),
+	Position = UDim2.new(0, 8, 0, 70),
+	BackgroundColor3 = WHITE,
+	BackgroundTransparency = 0.8,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+	Parent = Sidebar,
+})
+corner(tabIndicator, 8)
+livingStroke(tabIndicator, 1, true)
+
+local tabButtons = {}
+local tabPages = {}
+local tabNames = { "Logs", "History", "Status", "Settings" }
+local tabOrder = {}
+for i, n in ipairs(tabNames) do tabOrder[n] = i - 1 end
+-- posicion del indicador = cantidad de pestanas VISIBLES antes de esta
+access.tabIndex = function(name)
+	local idx = 0
+	for _, n in ipairs(tabNames) do
+		if n == name then return idx end
+		local tb = tabButtons[n]
+		if tb and tb.Visible then idx += 1 end
+	end
+	return 0
+end
+
+local TAB_ICONS = {
+	Logs = "rbxassetid://94212016861936",
+	History = "rbxassetid://123980022019922",
+	Settings = "rbxassetid://80758916183665",
+	Status = "rbxassetid://130551565616516",
+}
+local tabIcons = {}
+local tabBars = {}
+
+local function playTabBar(name)
+	local bar = tabBars[name]
+	if not bar then return end
+	bar.Size = UDim2.new(0, 2, 0, 0)
+	bar.BackgroundTransparency = 0
+	tween(bar, { Size = UDim2.new(0, 2, 0, 18) }, 0.3, Enum.EasingStyle.Quint)
+	task.delay(0.4, function()
+		if bar and bar.Parent and state.tab == name then
+			tween(bar, { BackgroundTransparency = 0.25 }, 0.35)
+		end
+	end)
+end
+
+local function switchTab(newTab)
+	if newTab and newTab == state.tab then
+		return
+	end
+	if newTab then
+		state.tab = newTab
+	end
+	for name, btn in pairs(tabButtons) do
+		local active = name == state.tab
+		local bar = tabBars[name]
+		if active then
+			tween(btn, { TextColor3 = WHITE })
+			if tabIcons[name] then tween(tabIcons[name], { ImageColor3 = WHITE }) end
+			btn.Font = FONT_LABEL
+			tween(tabIndicator, {
+				Position = UDim2.new(0, 8, 0, 70 + access.tabIndex(name) * 40),
+				Size = UDim2.new(1, -16, 0, 36),
+			}, 0.35, Enum.EasingStyle.Quint)
+			playTabBar(name)
+		else
+			tween(btn, { TextColor3 = SILVER })
+			if tabIcons[name] then tween(tabIcons[name], { ImageColor3 = SILVER }) end
+			btn.Font = FONT_VALUE
+			if bar then
+				tween(bar, { Size = UDim2.new(0, 2, 0, 0), BackgroundTransparency = 1 }, 0.2)
+			end
+		end
+		if tabPages[name] then
+			local pg = tabPages[name]
+			if active then
+				pg.Visible = true
+				if pg:IsA("CanvasGroup") then
+					pg.GroupTransparency = 1
+					tween(pg, { GroupTransparency = 0 }, 0.3)
+				end
+			else
+				pg.Visible = false
+			end
+		end
+	end
+end
+
+for i, name in ipairs(tabNames) do
+	local btn = create("TextButton", {
+		Size = UDim2.new(1, -20, 0, 36),
+		BackgroundTransparency = 1,
+		Text = "  " .. name,
+		TextColor3 = SILVER,
+		TextSize = 12,
+		Font = FONT_LABEL,
+		AutoButtonColor = false,
+		LayoutOrder = i,
+		ZIndex = 4,
+		Parent = tabList,
+	})
+	local bar = create("Frame", {
+		Size = UDim2.new(0, 2, 0, 0),
+		Position = UDim2.new(0, 4, 0.5, -9),
+		BackgroundColor3 = WHITE,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 6,
+		Parent = btn,
+	})
+	corner(bar, 1)
+	tabBars[name] = bar
+	tabIcons[name] = create("ImageLabel", {
+		Size = UDim2.new(0, 14, 0, 14),
+		Position = UDim2.new(0, 12, 0.5, -7),
+		BackgroundTransparency = 1,
+		Image = TAB_ICONS[name] or "",
+		ImageColor3 = SILVER,
+		ScaleType = Enum.ScaleType.Fit,
+		ZIndex = 5,
+		Parent = btn,
+	})
+	btn.MouseEnter:Connect(function()
+		if name ~= state.tab then
+			tween(btn, { TextColor3 = WHITE })
+			if tabIcons[name] then tween(tabIcons[name], { ImageColor3 = WHITE }) end
+		end
+	end)
+	btn.MouseLeave:Connect(function()
+		if name ~= state.tab then
+			tween(btn, { TextColor3 = SILVER })
+			if tabIcons[name] then tween(tabIcons[name], { ImageColor3 = SILVER }) end
+		end
+	end)
+	btn.MouseButton1Click:Connect(function()
+		switchTab(name)
+	end)
+	tabButtons[name] = btn
+end
+
+local hideBtn = create("TextButton", {
+	Size = UDim2.new(1, -24, 0, 34),
+	Position = UDim2.new(0, 12, 1, -42),
+	BackgroundColor3 = BG_INPUT,
+	BackgroundTransparency = 0.4,
+	Text = "  Hide",
+	TextColor3 = SILVER,
+	TextSize = 12,
+	Font = FONT_LABEL,
+	AutoButtonColor = false,
+	ZIndex = 4,
+	Parent = Sidebar,
+})
+corner(hideBtn, 10)
+livingStroke(hideBtn, 1, false)
+create("ImageLabel", {
+	Size = UDim2.new(0, 14, 0, 14),
+	Position = UDim2.new(0, 12, 0.5, -7),
+	BackgroundTransparency = 1,
+	Image = "rbxassetid://6031094678",
+	ImageColor3 = SILVER,
+	ScaleType = Enum.ScaleType.Fit,
+	ZIndex = 5,
+	Parent = hideBtn,
+})
+hideBtn.MouseEnter:Connect(function() tween(hideBtn, { BackgroundTransparency = 0.1, TextColor3 = WHITE }) end)
+hideBtn.MouseLeave:Connect(function() tween(hideBtn, { BackgroundTransparency = 0.4, TextColor3 = SILVER }) end)
+
+local miniBtn = create("Frame", {
+	Size = UDim2.new(0, 56, 0, 56),
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 18, 0.58, 0),
+	BackgroundColor3 = BG_MAIN,
+	BackgroundTransparency = 0.1,
+	Visible = false,
+	ClipsDescendants = true,
+	ZIndex = 100,
+	Parent = ScreenGui,
+})
+corner(miniBtn, 28)
+livingStroke(miniBtn, 2, true)
+local miniText = create("TextButton", {
+	Size = UDim2.new(1, 0, 1, 0),
+	BackgroundTransparency = 1,
+	Text = "CF",
+	TextColor3 = WHITE,
+	Font = FONT_TITLE,
+	TextSize = 18,
+	Parent = miniBtn,
+})
+livingText(miniText)
+
+hideBtn.MouseButton1Click:Connect(function()
+	tween(UIScale, { Scale = 0 }, 0.4, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+	task.delay(0.4, function()
+		Main.Visible = false
+		miniBtn.Visible = true
+		miniBtn.Size = UDim2.new(0, 0, 0, 0)
+		tween(miniBtn, { Size = UDim2.new(0, 56, 0, 56) }, 0.4, Enum.EasingStyle.Back)
+	end)
+end)
+
+local draggingMini = false
+local wasDragged = false
+local dragStart, miniStart
+miniText.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingMini = true
+		wasDragged = false
+		dragStart = input.Position
+		miniStart = miniBtn.Position
+	end
+end)
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingMini = false
+	end
+end)
+UserInputService.InputChanged:Connect(function(input)
+	if draggingMini and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - dragStart
+		if delta.Magnitude > 10 then
+			wasDragged = true
+			miniBtn.Position = UDim2.new(miniStart.X.Scale, miniStart.X.Offset + delta.X, miniStart.Y.Scale, miniStart.Y.Offset + delta.Y)
+		end
+	end
+end)
+miniText.MouseButton1Click:Connect(function()
+	if not wasDragged then
+		tween(miniBtn, { Size = UDim2.new(0, 0, 0, 0) }, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+		task.delay(0.3, function()
+			miniBtn.Visible = false
+			Main.Visible = true
+			tween(UIScale, { Scale = scaleFactor }, 0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		end)
+	end
+end)
+
+local dragBar = create("TextButton", {
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	Text = "",
+	ZIndex = 10,
+	Parent = Main,
+})
+local dragging = false
+local dragOrigin, frameOrigin
+dragBar.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragOrigin = input.Position
+		frameOrigin = Main.Position
+	end
+end)
+dragBar.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+	end
+end)
+UserInputService.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = (input.Position - dragOrigin) / UIScale.Scale
+		Main.Position = UDim2.new(frameOrigin.X.Scale, frameOrigin.X.Offset + delta.X, frameOrigin.Y.Scale, frameOrigin.Y.Offset + delta.Y)
+	end
+end)
+
+-- guard(newValue) -> true/false : permite bloquear el cambio (permisos)
+local toggleRefresh = {}
+local function makeToggle(parent, y, label, key, callback, guard)
+	local row = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 48),
+		Position = UDim2.new(0, 0, 0, y),
+		BackgroundColor3 = BG_ROW,
+		BackgroundTransparency = 0.3,
+		BorderSizePixel = 0,
+		ZIndex = 3,
+		Parent = parent,
+	})
+	corner(row, 10)
+	livingStroke(row, 1, true)
+	create("TextLabel", {
+		Size = UDim2.new(1, -70, 1, 0),
+		Position = UDim2.new(0, 14, 0, 0),
+		BackgroundTransparency = 1,
+		Text = label,
+		TextColor3 = WHITE,
+		TextSize = 12,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ZIndex = 4,
+		Parent = row,
+	})
+	local switchBg = create("TextButton", {
+		Name = "SwitchBg_" .. key,
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.new(0, 46, 0, 24),
+		BackgroundColor3 = BG_CHIP_OFF,
+		BorderSizePixel = 0,
+		Text = "",
+		AutoButtonColor = false,
+		ZIndex = 4,
+		Parent = row,
+	})
+	corner(switchBg, 12)
+	local swStroke, swGrad = livingStroke(switchBg, 1, false)
+	local knob = create("Frame", {
+		Size = UDim2.new(0, 18, 0, 18),
+		Position = UDim2.new(0, 3, 0.5, -9),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+		Parent = switchBg,
+	})
+	corner(knob, 9)
+	local function update()
+		local on = config[key]
+		tween(switchBg, { BackgroundColor3 = on and BG_CHIP_ON or BG_CHIP_OFF }, 0.25)
+		tween(knob, { Position = on and UDim2.new(1, -21, 0.5, -9) or UDim2.new(0, 3, 0.5, -9) }, 0.28, Enum.EasingStyle.Quint)
+		if swGrad then
+			swGrad.Color = bands(on and WHITE or SILVER, STEEL)
+		end
+	end
+	toggleRefresh[key] = update
+	update()
+	switchBg.MouseButton1Click:Connect(function()
+		local newVal = not config[key]
+		if guard and not guard(newVal) then return end
+		config[key] = newVal
+		update()
+		saveConfig()
+		if callback then callback(config[key]) end
+	end)
+	return row
+end
+
+-- Logs
+local LogsPage = create("CanvasGroup", {
+	Size = UDim2.new(1, -32, 1, -32),
+	Position = UDim2.new(0, 16, 0, 16),
+	BackgroundTransparency = 1,
+	ZIndex = 2,
+	Parent = Content,
+})
+create("UIPadding", { PaddingTop = UDim.new(0, 3), PaddingBottom = UDim.new(0, 3), PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 3), Parent = LogsPage })
+tabPages.Logs = LogsPage
+
+-- Auto-Join / Auto-Force requieren el permiso "Auto Joiners"
+local function joinGuard(newVal)
+	if newVal and not hasPerm("autojoin") then
+		pcall(denyNotifyFn, "Auto Joiners")
+		return false
+	end
+	return true
+end
+
+local togglesRow = create("Frame", { Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1, ZIndex = 3, Parent = LogsPage })
+local t1 = makeToggle(togglesRow, 0, "Auto-Join", "autoJoin", nil, joinGuard)
+t1.Size = UDim2.new(0.48, 0, 0, 44)
+t1.Position = UDim2.new(0, 0, 0, 0)
+local t2 = makeToggle(togglesRow, 0, "Auto-Force", "autoForce", nil, joinGuard)
+t2.Size = UDim2.new(0.48, 0, 0, 44)
+t2.Position = UDim2.new(0.52, 0, 0, 0)
+
+local feedHeader = create("Frame", {
+	Size = UDim2.new(1, 0, 0, 20),
+	Position = UDim2.new(0, 0, 0, 52),
+	BackgroundTransparency = 1,
+	ZIndex = 3,
+	Parent = LogsPage,
+})
+local liveLabel = create("TextLabel", {
+	Size = UDim2.new(0, 80, 1, 0),
+	BackgroundTransparency = 1,
+	Text = "LIVE FEED",
+	TextColor3 = WHITE,
+	TextSize = 11,
+	Font = FONT_LABEL,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 4,
+	Parent = feedHeader,
+})
+livingText(liveLabel)
+local detectedLabel = create("TextLabel", {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -56, 0, 0),
+	Size = UDim2.new(0, 80, 1, 0),
+	BackgroundTransparency = 1,
+	Text = "0 detected",
+	TextColor3 = STEEL,
+	TextSize = 11,
+	Font = FONT_STATUS,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	ZIndex = 4,
+	Parent = feedHeader,
+})
+local clearBtn = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, 0, 0.5, 0),
+	Size = UDim2.new(0, 48, 0, 20),
+	BackgroundColor3 = BG_CHIP_OFF,
+	BackgroundTransparency = 0.3,
+	Text = "Clear",
+	TextColor3 = WHITE,
+	TextSize = 10,
+	Font = FONT_LABEL,
+	AutoButtonColor = false,
+	ZIndex = 4,
+	Parent = feedHeader,
+})
+corner(clearBtn, 6)
+clearBtn.MouseEnter:Connect(function() tween(clearBtn, { BackgroundTransparency = 0, TextColor3 = WHITE }) end)
+clearBtn.MouseLeave:Connect(function() tween(clearBtn, { BackgroundTransparency = 0.3, TextColor3 = SILVER }) end)
+
+local feedBox = create("Frame", {
+	Size = UDim2.new(1, 0, 1, -76),
+	Position = UDim2.new(0, 0, 0, 76),
+	BackgroundColor3 = BG_MAIN,
+	BackgroundTransparency = 0.5,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+	Parent = LogsPage,
+})
+corner(feedBox, 12)
+livingStroke(feedBox, 1, false)
+
+local feedScroll = create("ScrollingFrame", {
+	Size = UDim2.new(1, -8, 1, -8),
+	Position = UDim2.new(0, 4, 0, 4),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	CanvasSize = UDim2.new(0, 0, 0, 0),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	ScrollingEnabled = true,
+	Active = true,
+	ScrollBarThickness = 4,
+	ScrollBarImageColor3 = WHITE,
+	ZIndex = 3,
+	Parent = feedBox,
+})
+local feedLayout = create("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = feedScroll })
+create("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4), Parent = feedScroll })
+
+local function updateCanvas(scroll, layout)
+	task.defer(function()
+		if scroll and layout then
+			scroll.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 8)
+		end
+	end)
+end
+
+local entryData = {}
+local entryUi = {} -- eggUid -> { wrapper, name, sub, data }
+
+-- Contador real de logs visibles (no se acumula: si se van, baja)
+local function recountDetected()
+	local n = 0
+	for _, ui in pairs(entryUi) do
+		if ui and ui.wrapper and ui.wrapper.Parent and ui.wrapper.Visible then
+			n += 1
+		end
+	end
+	state.detected = n
+	if detectedLabel then
+		detectedLabel.Text = tostring(n) .. " detected"
+	end
+	return n
+end
+
+
+-- Ordena el feed: el que más genera ($/s) arriba, el menor abajo
+local function resortFeed()
+	local list = {}
+	for _, child in ipairs(feedScroll:GetChildren()) do
+		if child.Name == "EntryWrapper" and entryData[child] then
+			list[#list + 1] = child
+		end
+	end
+	table.sort(list, function(a, b)
+		local va = tonumber(entryData[a].mps) or 0
+		local vb = tonumber(entryData[b].mps) or 0
+		if va ~= vb then return va > vb end
+		return a.Name < b.Name
+	end)
+	for i, child in ipairs(list) do
+		child.LayoutOrder = i
+	end
+end
+
+CX.clearFeedUi = function()
+	for _, child in ipairs(feedScroll:GetChildren()) do
+		if child:IsA("Frame") and child.Name == "EntryWrapper" then
+			tween(child, { Size = UDim2.new(1, 0, 0, 0) }, 0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+			task.delay(0.26, function() if child.Parent then child:Destroy() end end)
+		end
+	end
+	table.clear(entryData)
+	table.clear(entryUi)
+	state.detected = 0
+	detectedLabel.Text = "0 detected"
+	task.delay(0.3, function() updateCanvas(feedScroll, feedLayout) end)
+end
+
+clearBtn.MouseButton1Click:Connect(function()
+	-- Lo borrado NO debe volver: se ignora por eggUid y se borra tambien de Firebase
+	local keys = {}
+	local ts = os.time()
+	for uid in pairs(entryUi) do
+		CX.ignored[uid] = ts
+		if CX.lastFbKeys[uid] then keys[#keys + 1] = CX.lastFbKeys[uid] end
+	end
+	CX.clearFeedUi()
+	CX.del(keys)
+end)
+
+local joinNotifFn, showToast, logNotifFn
+local refreshHistoryFn
+local appendHistoryRow -- forward decl (definida en bloque History)
+
+
+local function addEntry(data)
+	if type(data) ~= "table" then return end
+	if tonumber(data.placeId) ~= access.PLACE_ID then return end -- otro juego: no se muestra
+	-- Anti-duplicado: no crear otra fila si este eggUid ya está en el feed
+	local euid = data.eggUid and tostring(data.eggUid) or nil
+	if euid and entryUi[euid] and entryUi[euid].wrapper and entryUi[euid].wrapper.Parent then
+		return
+	end
+	local col = valueColor(data.mps, data.og)
+	local show = meetsThreshold(data)
+
+	-- History SIEMPRE (datos) si >= 10M, aunque no se pinte en Logs por threshold
+	if (tonumber(data.mps) or 0) >= 10000000 and not data.requeued then
+		local h = {
+			name = data.name,
+			mps = data.mps,
+			time = now(),
+			mutation = CX.mutDisplay(data),
+			jobId = data.jobId,
+			placeId = data.placeId,
+		}
+		if appendHistoryRow then
+			pcall(appendHistoryRow, h)
+		else
+			table.insert(state.history, 1, h)
+			if #state.history > 50 then table.remove(state.history) end
+		end
+	end
+
+	-- Si no pasa threshold: no crear card de feed (antes creaba filas invisibles = lag)
+	if not show then
+		return
+	end
+	if not data.silent and config.logSoundEnabled then
+		playSound(config.logSoundId or "125621644257669", 0.3, 1)
+	end
+	local isLow = not data.og and (tonumber(data.mps) or 0) < 10000000
+
+	local wrapper = create("Frame", {
+		Name = "EntryWrapper",
+		Size = UDim2.new(1, 0, 0, 0),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		Visible = show,
+		Parent = feedScroll,
+	})
+	entryData[wrapper] = data
+
+	local card = create("Frame", {
+		Size = UDim2.new(1, -4, 1, 0),
+		Position = UDim2.new(0, 50, 0, 0),
+		BackgroundColor3 = BG_ROW,
+		BackgroundTransparency = 0.2,
+		ZIndex = 4,
+		Parent = wrapper,
+	})
+	corner(card, 8)
+	staticStroke(card, 1)
+	-- sin Glow ni UIScale animado = sin lag al spawnear logs
+	local side = create("Frame", {
+		Name = isLow and "SideLineBase" or "SideLine",
+		Size = UDim2.new(0, 6, 1, -16),
+		Position = UDim2.new(0, 6, 0, 8),
+		BackgroundColor3 = col,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+		Parent = card,
+	})
+	corner(side, 1)
+
+	-- Foto de perfil del Pet
+	local photo = create("Frame", {
+		Name = "Photo",
+		Size = UDim2.new(0, 44, 0, 44),
+		Position = UDim2.new(0, 18, 0.5, -22),
+		BackgroundColor3 = Color3.fromRGB(8, 8, 9),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+		Parent = card,
+	})
+	corner(photo, 8)
+	create("ImageLabel", {
+		Name = "Icon",
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Image = tostring(data.icon or ""),
+		ScaleType = Enum.ScaleType.Fit,
+		ZIndex = 6,
+		Parent = photo,
+	})
+
+	-- Línea 1: Nombre [ Cuánto genera ]
+	local nameLbl = create("TextLabel", {
+		Name = isLow and "NameLabelBase" or "NameLabel",
+		Size = UDim2.new(1, -200, 0, 22),
+		Position = UDim2.new(0, 70, 0, 7),
+		BackgroundTransparency = 1,
+		Text = tostring(data.name or "Unknown") .. "  [ " .. formatValue(data.mps) .. " ]",
+		TextColor3 = col,
+		TextSize = 13, -- fijo: evita layout costoso de TextScaled
+		TextScaled = false,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 5,
+		Parent = card,
+	})
+
+	-- Línea 2 (descripción): jugadores • spawn • mutación
+	local subLbl = create("TextLabel", {
+		Size = UDim2.new(1, -200, 0, 14),
+		Position = UDim2.new(0, 70, 0, 33),
+		BackgroundTransparency = 1,
+		Text = subText(data),
+		TextColor3 = SILVER,
+		TextSize = 11, -- fijo: TextScaled en cada tick de edad = lag
+		TextScaled = false,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 5,
+		Parent = card,
+	})
+
+	if data.eggUid then
+		entryUi[data.eggUid] = {
+			wrapper = wrapper,
+			name = nameLbl,
+			sub = subLbl,
+			data = data,
+			_staticSub = subStatic(data), -- cache: edad se pinta aparte, 1 fila a la vez
+		}
+	end
+
+	local btns = create("Frame", {
+		Size = UDim2.new(0, 100, 1, 0),
+		Position = UDim2.new(1, -110, 0, 0),
+		BackgroundTransparency = 1,
+		ZIndex = 6,
+		Parent = card,
+	})
+	local joinBtn = create("TextButton", {
+		Name = "JoinBtn",
+		Size = UDim2.new(0, 44, 0, 24),
+		Position = UDim2.new(0, 0, 0.5, -12),
+		BackgroundColor3 = BG_INPUT,
+		Text = "JOIN",
+		TextColor3 = WHITE,
+		TextSize = 10,
+		Font = FONT_LABEL,
+		AutoButtonColor = true,
+		ZIndex = 7,
+		Parent = btns,
+	})
+	corner(joinBtn, 6)
+	staticStroke(joinBtn, 1)
+	local forceBtn = create("TextButton", {
+		Size = UDim2.new(0, 44, 0, 24),
+		Position = UDim2.new(0, 50, 0.5, -12),
+		BackgroundColor3 = BG_CHIP_ON,
+		Text = "FORCE",
+		TextColor3 = Color3.fromRGB(0, 0, 0),
+		TextSize = 10,
+		Font = FONT_LABEL,
+		AutoButtonColor = true,
+		ZIndex = 7,
+		Parent = btns,
+	})
+	corner(forceBtn, 6)
+	-- teleport / forceTeleport ya validan el permiso "Auto Joiners"
+	joinBtn.MouseButton1Click:Connect(function()
+		teleport(data.jobId, data.placeId)
+	end)
+	forceBtn.MouseButton1Click:Connect(function()
+		forceTeleport(data.jobId, config.forceTime, data.placeId)
+	end)
+
+	-- Animación de aparición (Quint suave, no Elastic = fluido sin lag)
+	wrapper.Size = UDim2.new(1, 0, 0, 0)
+	card.Position = UDim2.new(0, 70, 0, 0)
+	card.BackgroundTransparency = 0.9
+	tween(wrapper, { Size = UDim2.new(1, 0, 0, 58) }, 0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+	tween(card, { Position = UDim2.new(0, 0, 0, 0), BackgroundTransparency = 0.2 }, 0.38, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+
+	recountDetected()
+
+	-- Cap de filas: evita crecer infinito (y el lag que eso trae)
+	local entries = {}
+	for _, c in ipairs(feedScroll:GetChildren()) do
+		if c.Name == "EntryWrapper" then entries[#entries + 1] = c end
+	end
+	if #entries > 120 then
+		for i = 1, #entries - 120 do
+			local w = entries[i]
+			entryData[w] = nil
+			if w and w.Parent then w:Destroy() end
+		end
+	end
+
+	-- deferSort=true cuando vienen varios logs en el mismo poll → un solo resort al final
+	if not data._deferSort then
+		resortFeed()
+		updateCanvas(feedScroll, feedLayout)
+	end
+
+	if show and not data.silent and config.logNotify and logNotifFn then
+		-- Notifs pesadas: max 2 simultáneas vía throttle interno de logNotifFn
+		pcall(logNotifFn, data)
+	end
+
+	if show and not data.requeued and hasPerm("autojoin") then
+		local mpsNow = tonumber(data.mps) or 0
+		local doJoin = config.autoJoin and mpsNow >= (tonumber(config.minAutoJoin) or 0)
+		local doForce = config.autoForce and mpsNow >= (tonumber(config.minAutoForce) or 0)
+		if doJoin or doForce then
+			if joinNotifFn then pcall(joinNotifFn, data.name, data.mps) end
+		end
+		if doJoin then
+			teleport(data.jobId, data.placeId)
+		end
+		if doForce then
+			forceTeleport(data.jobId, config.forceTime, data.placeId)
+		end
+	end
+end
+
+-- Quita del panel un log cuyo Pet ya no está disponible
+-- Animación ligera: solo el wrapper (no 20+ tweens por fila = lag en prune masivo)
+local function removeEntry(wrapper)
+	if not wrapper or not wrapper.Parent then return end
+	entryData[wrapper] = nil
+	-- limpiar entryUi si apunta aquí
+	for uid, ui in pairs(entryUi) do
+		if ui and ui.wrapper == wrapper then
+			entryUi[uid] = nil
+			break
+		end
+	end
+	-- Animación de salida (solo wrapper + card, no cada hijo)
+	local card = wrapper:FindFirstChildWhichIsA("Frame")
+	tween(wrapper, { Size = UDim2.new(1, 0, 0, 0) }, 0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+	if card then
+		tween(card, { BackgroundTransparency = 1, Position = UDim2.new(0, -20, 0, 0) }, 0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+	end
+	task.delay(0.24, function()
+		if wrapper and wrapper.Parent then wrapper:Destroy() end
+		recountDetected()
+		updateCanvas(feedScroll, feedLayout)
+	end)
+end
+
+-- Re-aplica filtros (Settings): oculta/muestra filas y recrea las que estaban filtradas
+CX.refilter = function()
+	for _, child in ipairs(feedScroll:GetChildren()) do
+		if child.Name == "EntryWrapper" and entryData[child] then
+			child.Visible = meetsThreshold(entryData[child])
+		end
+	end
+	local list = {}
+	for uid, entry in pairs(CX.lastFresh) do
+		local ui = entryUi[uid]
+		if not (ui and ui.wrapper and ui.wrapper.Parent) and not CX.isIgnored(uid) and meetsThreshold(entry) then
+			list[#list + 1] = entry
+		end
+	end
+	table.sort(list, function(a, b) return (tonumber(a.mps) or 0) > (tonumber(b.mps) or 0) end)
+	for _, entry in ipairs(list) do
+		local e = table.clone(entry)
+		e.requeued = true  -- sin sonido / notificacion / auto-join / history
+		e.silent = true
+		e._deferSort = true
+		pcall(addEntry, e)
+	end
+	resortFeed()
+	updateCanvas(feedScroll, feedLayout)
+	recountDetected()
+end
+
+-- History
+local HistoryPage = create("CanvasGroup", {
+	Size = UDim2.new(1, -32, 1, -32),
+	Position = UDim2.new(0, 16, 0, 16),
+	BackgroundTransparency = 1,
+	Visible = false,
+	ZIndex = 2,
+	Parent = Content,
+})
+create("UIPadding", { PaddingTop = UDim.new(0, 3), PaddingBottom = UDim.new(0, 3), PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 3), Parent = HistoryPage })
+tabPages.History = HistoryPage
+create("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	Text = "Detection History",
+	TextColor3 = WHITE,
+	TextSize = 18,
+	Font = FONT_TITLE,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 3,
+	Parent = HistoryPage,
+})
+local histScroll = create("ScrollingFrame", {
+	Size = UDim2.new(1, 0, 1, -40),
+	Position = UDim2.new(0, 0, 0, 40),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	CanvasSize = UDim2.new(0, 0, 0, 0),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	ScrollingEnabled = true,
+	Active = true,
+	ScrollBarThickness = 4,
+	ScrollBarImageColor3 = WHITE,
+	ZIndex = 3,
+	Parent = HistoryPage,
+})
+local histLayout = create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = histScroll })
+create("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4), Parent = histScroll })
+
+local HIST_MAX = 50 -- menos filas = menos lag
+local histRowCount = 0
+local histDirty = true -- solo rebuild completo al abrir la pestaña si hace falta
+
+local function makeHistoryRow(h, order)
+	local row = create("Frame", {
+		Name = "HistRow",
+		Size = UDim2.new(1, 0, 0, 46),
+		BackgroundColor3 = BG_ROW,
+		BackgroundTransparency = 0.3,
+		LayoutOrder = order or 0,
+		ZIndex = 4,
+		Parent = histScroll,
+	})
+	corner(row, 8)
+	-- staticStroke: History NO anima gradients (era el mayor lag de History)
+	staticStroke(row, 1)
+	create("TextLabel", {
+		Size = UDim2.new(0, 60, 1, 0),
+		Position = UDim2.new(0, 14, 0, 0),
+		BackgroundTransparency = 1,
+		Text = tostring(h.time or ""),
+		TextColor3 = STEEL,
+		TextSize = 11,
+		Font = FONT_STATUS,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ZIndex = 5,
+		Parent = row,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(1, -180, 1, 0),
+		Position = UDim2.new(0, 78, 0, 0),
+		BackgroundTransparency = 1,
+		Text = tostring(h.name or ""),
+		TextColor3 = WHITE,
+		TextSize = 13,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 5,
+		Parent = row,
+	})
+	create("TextLabel", {
+		Name = "MPSLabel",
+		Size = UDim2.new(0, 80, 1, 0),
+		Position = UDim2.new(1, -88, 0, 0),
+		BackgroundTransparency = 1,
+		Text = formatValue(h.mps),
+		TextColor3 = WHITE,
+		TextSize = 12,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		ZIndex = 5,
+		Parent = row,
+	})
+	histRowCount += 1
+	return row
+end
+
+-- Rebuild SOLO cuando se abre History (y está dirty). Nunca en cada log nuevo.
+local function refreshHistory()
+	if not histDirty and histRowCount > 0 then return end
+	for _, c in ipairs(histScroll:GetChildren()) do
+		if c:IsA("Frame") then c:Destroy() end
+	end
+	histRowCount = 0
+	local list = state.history
+	local n = math.min(#list, HIST_MAX)
+	for i = 1, n do
+		makeHistoryRow(list[i], i)
+	end
+	histDirty = false
+	updateCanvas(histScroll, histLayout)
+end
+
+-- Añade 1 fila arriba sin destruir todo el History (evita lag al aparecer logs)
+appendHistoryRow = function(h)
+	table.insert(state.history, 1, h)
+	while #state.history > HIST_MAX do
+		table.remove(state.history)
+	end
+	-- Si el usuario NO está en History: solo datos, 0 UI
+	if state.tab ~= "History" then
+		histDirty = true
+		return
+	end
+	-- Está mirando History: insertar 1 fila barata
+	histRowCount = 0
+	for _, c in ipairs(histScroll:GetChildren()) do
+		if c.Name == "HistRow" then
+			histRowCount += 1
+			c.LayoutOrder = (c.LayoutOrder or 0) + 1
+		end
+	end
+	makeHistoryRow(h, 0)
+	-- Cap visual
+	if histRowCount > HIST_MAX then
+		local rows = {}
+		for _, c in ipairs(histScroll:GetChildren()) do
+			if c.Name == "HistRow" then rows[#rows + 1] = c end
+		end
+		table.sort(rows, function(a, b) return (a.LayoutOrder or 0) > (b.LayoutOrder or 0) end)
+		for i = HIST_MAX + 1, #rows do
+			rows[i]:Destroy()
+			histRowCount -= 1
+		end
+	end
+	histDirty = false
+	updateCanvas(histScroll, histLayout)
+end
+
+refreshHistoryFn = refreshHistory
+
+local oldSwitch = switchTab
+switchTab = function(newTab)
+	if newTab and newTab == state.tab then
+		return
+	end
+	oldSwitch(newTab)
+	if state.tab == "History" then
+		refreshHistory()
+	end
+end
+
+
+
+local onAccessChanged
+do
+-- Settings
+local SettingsPage = create("CanvasGroup", {
+	Size = UDim2.new(1, -32, 1, -32),
+	Position = UDim2.new(0, 16, 0, 16),
+	BackgroundTransparency = 1,
+	Visible = false,
+	ZIndex = 2,
+	Parent = Content,
+})
+create("UIPadding", { PaddingTop = UDim.new(0, 3), PaddingBottom = UDim.new(0, 3), PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 3), Parent = SettingsPage })
+tabPages.Settings = SettingsPage
+create("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 26),
+	BackgroundTransparency = 1,
+	Text = "Settings",
+	TextColor3 = WHITE,
+	TextSize = 20,
+	Font = FONT_TITLE,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 3,
+	Parent = SettingsPage,
+})
+create("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 16),
+	Position = UDim2.new(0, 0, 0, 27),
+	BackgroundTransparency = 1,
+	Text = "Preferences, filters and automation",
+	TextColor3 = SILVER,
+	TextSize = 12,
+	Font = FONT_STATUS,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 3,
+	Parent = SettingsPage,
+})
+local settingsScroll = create("ScrollingFrame", {
+	Size = UDim2.new(1, 0, 1, -52),
+	Position = UDim2.new(0, 0, 0, 52),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 4,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(0, 0, 0, 0),
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	ScrollingEnabled = true,
+	Active = true,
+	ScrollBarImageColor3 = WHITE,
+	ZIndex = 3,
+	Parent = SettingsPage,
+})
+local settingsLayout = create("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = settingsScroll })
+create("UIPadding", {
+	PaddingTop = UDim.new(0, 4),
+	PaddingBottom = UDim.new(0, 8),
+	PaddingLeft = UDim.new(0, 4),
+	PaddingRight = UDim.new(0, 8),
+	Parent = settingsScroll,
+})
+
+local settingOrder = 0
+local BLACK = Color3.fromRGB(0, 0, 0)
+
+-- Encabezado de seccion (texto en mayusculas + linea fina)
+local function sectionHeader(text)
+	settingOrder += 1
+	local h = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 28),
+		BackgroundTransparency = 1,
+		LayoutOrder = settingOrder,
+		ZIndex = 4,
+		Parent = settingsScroll,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 14),
+		Position = UDim2.new(0, 4, 0, 10),
+		BackgroundTransparency = 1,
+		Text = string.upper(text),
+		TextColor3 = SILVER,
+		TextSize = 11,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ZIndex = 5,
+		Parent = h,
+	})
+	create("Frame", {
+		Size = UDim2.new(1, -8, 0, 1),
+		Position = UDim2.new(0, 4, 1, -2),
+		BackgroundColor3 = STEEL,
+		BackgroundTransparency = 0.45,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+		Parent = h,
+	})
+	return h
+end
+
+local function settingRow(title, desc, height)
+	settingOrder += 1
+	local row = create("Frame", {
+		Size = UDim2.new(1, 0, 0, height or 64),
+		BackgroundColor3 = BG_ROW,
+		BackgroundTransparency = 0.25,
+		BorderSizePixel = 0,
+		LayoutOrder = settingOrder,
+		ZIndex = 4,
+		Parent = settingsScroll,
+	})
+	corner(row, 10)
+	staticStroke(row, 1)
+	local accent = create("Frame", {
+		Size = UDim2.new(0, 3, 0, 30),
+		Position = UDim2.new(0, 0, 0, 17),
+		BackgroundColor3 = SILVER,
+		BackgroundTransparency = 0.6,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+		Parent = row,
+	})
+	corner(accent, 2)
+	create("TextLabel", {
+		Size = UDim2.new(1, -170, 0, 18),
+		Position = UDim2.new(0, 18, 0, 13),
+		BackgroundTransparency = 1,
+		Text = title,
+		TextColor3 = WHITE,
+		TextSize = 14,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 5,
+		Parent = row,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(1, -170, 0, 14),
+		Position = UDim2.new(0, 18, 0, 34),
+		BackgroundTransparency = 1,
+		Text = desc,
+		TextColor3 = SILVER,
+		TextTransparency = 0.25,
+		TextSize = 11,
+		Font = FONT_STATUS,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 5,
+		Parent = row,
+	})
+	row.MouseEnter:Connect(function()
+		tween(row, { BackgroundTransparency = 0.08 })
+		tween(accent, { BackgroundTransparency = 0, BackgroundColor3 = WHITE })
+	end)
+	row.MouseLeave:Connect(function()
+		tween(row, { BackgroundTransparency = 0.25 })
+		tween(accent, { BackgroundTransparency = 0.6, BackgroundColor3 = SILVER })
+	end)
+	return row
+end
+
+-- Chips (filtros multi-seleccion)
+local function makeChip(parent, text, w, order)
+	local b = create("TextButton", {
+		Size = UDim2.new(0, w or 64, 0, 26),
+		BackgroundColor3 = BG_INPUT,
+		Text = text,
+		TextColor3 = WHITE,
+		TextSize = 11,
+		Font = FONT_LABEL,
+		AutoButtonColor = false,
+		LayoutOrder = order or 0,
+		ZIndex = 6,
+		Parent = parent,
+	})
+	corner(b, 8)
+	staticStroke(b, 1)
+	return b
+end
+local function setChip(b, on)
+	tween(b, { BackgroundColor3 = on and WHITE or BG_INPUT, TextColor3 = on and BLACK or WHITE }, 0.2)
+end
+local function chipRow(row)
+	local f = create("Frame", {
+		Size = UDim2.new(1, -36, 0, 26),
+		Position = UDim2.new(0, 18, 0, 64),
+		BackgroundTransparency = 1,
+		ZIndex = 5,
+		Parent = row,
+	})
+	create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = f,
+	})
+	return f
+end
+
+-- ============ GENERAL ============
+sectionHeader("General")
+
+local forceRow = settingRow("Force Time", "Duration for force-join retries")
+local forceBtn = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -16, 0.5, 0),
+	Size = UDim2.new(0, 60, 0, 30),
+	BackgroundColor3 = BG_INPUT,
+	Text = config.forceTime .. "s",
+	TextColor3 = WHITE,
+	TextSize = 13,
+	Font = FONT_LABEL,
+	AutoButtonColor = false,
+	ZIndex = 5,
+	Parent = forceRow,
+})
+corner(forceBtn, 10)
+livingStroke(forceBtn, 1, true)
+forceBtn.MouseEnter:Connect(function() tween(forceBtn, { BackgroundColor3 = BG_CHIP_ON }) end)
+forceBtn.MouseLeave:Connect(function() tween(forceBtn, { BackgroundColor3 = BG_INPUT }) end)
+local forceOptions = { 5, 10, 15, 20, 30 }
+local forceIdx = 2
+for i, v in ipairs(forceOptions) do
+	if v == config.forceTime then forceIdx = i break end
+end
+forceBtn.MouseButton1Click:Connect(function()
+	forceIdx = forceIdx % #forceOptions + 1
+	config.forceTime = forceOptions[forceIdx]
+	forceBtn.Text = config.forceTime .. "s"
+	saveConfig()
+end)
+
+local threshRow = settingRow("Threshold", "Minimum value (ej: 10M, 50M, 1B, 0)")
+local threshBox = create("TextBox", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -16, 0.5, 0),
+	Size = UDim2.new(0, 80, 0, 30),
+	BackgroundColor3 = BG_INPUT,
+	Text = config.threshold,
+	PlaceholderText = "10M",
+	PlaceholderColor3 = STEEL,
+	TextColor3 = WHITE,
+	TextSize = 13,
+	Font = FONT_LABEL,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	ClearTextOnFocus = false,
+	ZIndex = 5,
+	Parent = threshRow,
+})
+corner(threshBox, 10)
+livingStroke(threshBox, 1, true)
+create("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = threshBox })
+
+local function applyThresholdFilter()
+	local detected = 0
+	for _, child in ipairs(feedScroll:GetChildren()) do
+		if child.Name == "EntryWrapper" and entryData[child] then
+			local vis = meetsThreshold(entryData[child])
+			child.Visible = vis
+			if vis then detected += 1 end
+		end
+	end
+	state.detected = detected
+	detectedLabel.Text = tostring(state.detected) .. " detected"
+	updateCanvas(feedScroll, feedLayout)
+end
+
+threshBox.FocusLost:Connect(function()
+	local raw = tostring(threshBox.Text or ""):gsub("%s+", ""):upper()
+	if raw == "" then
+		raw = "0"
+	end
+	if parseValue(raw) < 250000000 then raw = "250M" end
+	config.threshold = raw
+	threshBox.Text = raw
+	saveConfig()
+	applyThresholdFilter()
+end)
+
+-- ============ FILTERS ============
+sectionHeader("Filters")
+
+-- Mutacion: ALL o solo las seleccionadas
+local MUT_OPTIONS = {
+	{ label = "Divine", key = "divin" },
+	{ label = "Eternal", key = "eternal" },
+	{ label = "Secrets", key = "secret" },
+}
+local mutRow = settingRow("Mutation Filter", "Only show and notify pets with the selected mutation", 102)
+local mutChips = chipRow(mutRow)
+local mutAll = makeChip(mutChips, "ALL", 56, 0)
+local mutBtns = {}
+local function paintMut()
+	setChip(mutAll, next(config.filterMut) == nil)
+	for _, o in ipairs(MUT_OPTIONS) do
+		setChip(mutBtns[o.key], config.filterMut[o.key] == true)
+	end
+end
+for i, o in ipairs(MUT_OPTIONS) do
+	local b = makeChip(mutChips, o.label, 76, i)
+	mutBtns[o.key] = b
+	b.MouseButton1Click:Connect(function()
+		config.filterMut[o.key] = (not config.filterMut[o.key]) or nil
+		popButton(b)
+		paintMut()
+		saveConfig()
+		if CX.refilter then pcall(CX.refilter) end
+	end)
+end
+mutAll.MouseButton1Click:Connect(function()
+	config.filterMut = {}
+	popButton(mutAll)
+	paintMut()
+	saveConfig()
+	if CX.refilter then pcall(CX.refilter) end
+end)
+paintMut()
+
+-- Jugadores del servidor: ALL o un boton que cicla 7/1 -> 7/2 ... -> 7/7 en cada click
+local plrRow = settingRow("Server Players", "ALL = no restriction. Click 7/N to cycle the player count (7/1 to 7/7)", 102)
+local plrChips = chipRow(plrRow)
+local plrAll = makeChip(plrChips, "ALL", 56, 0)
+local plrCycle = makeChip(plrChips, "7/1", 56, 1)
+local function curPlayers()
+	local cur = nil
+	for n in pairs(config.filterPlayers) do
+		if not cur or n < cur then cur = n end
+	end
+	return cur
+end
+local function paintPlr()
+	local cur = curPlayers()
+	config.filterPlayers = cur and { [cur] = true } or {}
+	plrCycle.Text = "7/" .. tostring(cur or 1)
+	setChip(plrAll, cur == nil)
+	setChip(plrCycle, cur ~= nil)
+end
+plrCycle.MouseButton1Click:Connect(function()
+	local cur = curPlayers()
+	local nxt = cur and (cur % 7 + 1) or 1
+	config.filterPlayers = { [nxt] = true }
+	popButton(plrCycle)
+	paintPlr()
+	saveConfig()
+	if CX.refilter then pcall(CX.refilter) end
+end)
+plrAll.MouseButton1Click:Connect(function()
+	config.filterPlayers = {}
+	popButton(plrAll)
+	paintPlr()
+	saveConfig()
+	if CX.refilter then pcall(CX.refilter) end
+end)
+paintPlr()
+
+-- ============ AUTO JOIN ============
+sectionHeader("Auto Join")
+
+-- Minimos de Auto-Join / Auto-Force (NO se guardan: siempre arrancan vacios y apagados)
+local function minRow(title, desc, cfgKey)
+	local r = settingRow(title, desc)
+	local box = create("TextBox", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -16, 0.5, 0),
+		Size = UDim2.new(0, 96, 0, 30),
+		BackgroundColor3 = BG_INPUT,
+		Text = "",
+		PlaceholderText = "e.g. 2B",
+		PlaceholderColor3 = STEEL,
+		TextColor3 = WHITE,
+		TextSize = 13,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		ClearTextOnFocus = false,
+		ZIndex = 5,
+		Parent = r,
+	})
+	corner(box, 10)
+	livingStroke(box, 1, true)
+	create("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = box })
+	box.FocusLost:Connect(function()
+		local raw = tostring(box.Text or ""):gsub("%s+", ""):upper()
+		local n = parseValue(raw)
+		if raw == "" or n <= 0 then
+			config[cfgKey] = 0
+			box.Text = ""
+		else
+			config[cfgKey] = n
+			box.Text = raw
+		end
+	end)
+	return box
+end
+minRow("Auto-Join Minimum", "Auto-Join only joins pets at or above this value", "minAutoJoin")
+minRow("Auto-Force Minimum", "Auto-Force only joins pets at or above this value", "minAutoForce")
+
+-- ============ NOTIFICATIONS ============
+sectionHeader("Notifications")
+
+local logNotifRow = settingRow("Log Notifications", "Pop-up with pet photo on new logs. Click it to join")
+local logNotifBtn = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -16, 0.5, 0),
+	Size = UDim2.new(0, 60, 0, 30),
+	BackgroundColor3 = config.logNotify and WHITE or BG_INPUT,
+	Text = config.logNotify and "ON" or "OFF",
+	TextColor3 = config.logNotify and Color3.fromRGB(0, 0, 0) or WHITE,
+	TextSize = 13,
+	Font = FONT_LABEL,
+	AutoButtonColor = false,
+	ZIndex = 5,
+	Parent = logNotifRow,
+})
+corner(logNotifBtn, 10)
+livingStroke(logNotifBtn, 1, true)
+logNotifBtn.MouseButton1Click:Connect(function()
+	config.logNotify = not config.logNotify
+	logNotifBtn.Text = config.logNotify and "ON" or "OFF"
+	tween(logNotifBtn, { BackgroundColor3 = config.logNotify and WHITE or BG_INPUT, TextColor3 = config.logNotify and Color3.fromRGB(0, 0, 0) or WHITE }, 0.25)
+	popButton(logNotifBtn)
+	saveConfig()
+end)
+
+local soundRow = settingRow("Log Sound ID", "Asset ID played when a new log appears")
+local soundExpand = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -14, 0, 20),
+	Size = UDim2.new(0, 22, 0, 24),
+	BackgroundTransparency = 1,
+	Text = "v",
+	TextColor3 = SILVER,
+	TextSize = 12,
+	Font = FONT_LABEL,
+	AutoButtonColor = false,
+	ZIndex = 6,
+	Parent = soundRow,
+})
+local soundBox = create("TextBox", {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -42, 0, 17),
+	Size = UDim2.new(0, 118, 0, 30),
+	BackgroundColor3 = BG_INPUT,
+	Text = config.logSoundId or "125621644257669",
+	PlaceholderText = "Sound ID",
+	PlaceholderColor3 = STEEL,
+	TextColor3 = WHITE,
+	TextSize = 11,
+	Font = FONT_LABEL,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	ClearTextOnFocus = false,
+	ZIndex = 5,
+	Parent = soundRow,
+})
+corner(soundBox, 6)
+create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = soundBox })
+livingStroke(soundBox, 1, false)
+soundBox.FocusLost:Connect(function()
+	if not config.logSoundEnabled then
+		soundBox.Text = config.logSoundId or "125621644257669"
+		return
+	end
+	local cleaned = (soundBox.Text or ""):gsub("%D+", "")
+	if cleaned == "" then
+		soundBox.Text = config.logSoundId or "125621644257669"
+		return
+	end
+	config.logSoundId = cleaned
+	soundBox.Text = cleaned
+	saveConfig()
+	playSound(cleaned, 0.4, 1)
+end)
+soundRow.ClipsDescendants = true
+local soundExtra = create("CanvasGroup", {
+	GroupTransparency = 1,
+	Position = UDim2.new(0, 2, 0, 64),
+	Size = UDim2.new(1, -4, 0, 0),
+	BackgroundTransparency = 1,
+	ClipsDescendants = true,
+	ZIndex = 5,
+	Parent = soundRow,
+})
+create("Frame", {
+	Position = UDim2.new(0, 14, 0, 2),
+	Size = UDim2.new(1, -28, 0, 1),
+	BackgroundColor3 = STEEL,
+	BackgroundTransparency = 0.4,
+	BorderSizePixel = 0,
+	ZIndex = 5,
+	Parent = soundExtra,
+})
+local function updateSoundState()
+	local en = config.logSoundEnabled
+	soundBox.TextEditable = en
+	soundBox.TextColor3 = en and WHITE or STEEL
+	soundBox.BackgroundColor3 = en and BG_INPUT or BG_CHIP_OFF
+end
+local enableSound = makeToggle(soundExtra, 8, "Enable Log Sound", "logSoundEnabled", updateSoundState)
+enableSound.BackgroundTransparency = 1
+local esStroke = enableSound:FindFirstChildOfClass("UIStroke")
+if esStroke then esStroke.Enabled = false end
+updateSoundState()
+local soundOpen = false
+soundExpand.MouseButton1Click:Connect(function()
+	soundOpen = not soundOpen
+	soundExpand.Text = soundOpen and "^" or "v"
+	tween(soundRow, { Size = UDim2.new(1, 0, 0, soundOpen and 124 or 64) }, 0.3, Enum.EasingStyle.Quint)
+	tween(soundExtra, { Size = UDim2.new(1, -4, 0, soundOpen and 60 or 0) }, 0.3, Enum.EasingStyle.Quint)
+	tween(soundExtra, { GroupTransparency = soundOpen and 0 or 1 }, 0.3, Enum.EasingStyle.Quint)
+end)
+
+-- ============ SYSTEM ============
+sectionHeader("System")
+
+-- View Cebo (Owner o staff con permiso): banner + highlight de scanners
+do
+	local viewCeboRow = settingRow("View Cebo", "Show CeboScripts banner + avatar highlight on scanners")
+	viewCeboRow.Visible = access.canCebo()
+	access.refreshCeboRow = function() viewCeboRow.Visible = access.canCebo() end
+	local viewCeboBtn = create("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -16, 0.5, 0),
+		Size = UDim2.new(0, 60, 0, 30),
+		BackgroundColor3 = config.viewCebo and WHITE or BG_INPUT,
+		Text = config.viewCebo and "ON" or "OFF",
+		TextColor3 = config.viewCebo and Color3.fromRGB(0, 0, 0) or WHITE,
+		TextSize = 13,
+		Font = FONT_LABEL,
+		AutoButtonColor = false,
+		ZIndex = 5,
+		Parent = viewCeboRow,
+	})
+	corner(viewCeboBtn, 10)
+	livingStroke(viewCeboBtn, 1, true)
+	viewCeboBtn.MouseButton1Click:Connect(function()
+		config.viewCebo = not config.viewCebo
+		viewCeboBtn.Text = config.viewCebo and "ON" or "OFF"
+		tween(viewCeboBtn, { BackgroundColor3 = config.viewCebo and WHITE or BG_INPUT, TextColor3 = config.viewCebo and Color3.fromRGB(0, 0, 0) or WHITE }, 0.25)
+		popButton(viewCeboBtn)
+		saveConfig()
+		if updateTags then pcall(updateTags) end -- aplica / quita tags al instante
+	end)
+end
+
+local autoExecRow = settingRow("Auto Execute Finder", "Re-executes the Finder automatically after every teleport")
+local autoExecBtn = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -16, 0.5, 0),
+	Size = UDim2.new(0, 60, 0, 30),
+	BackgroundColor3 = config.autoExec and WHITE or BG_INPUT,
+	Text = config.autoExec and "ON" or "OFF",
+	TextColor3 = config.autoExec and Color3.fromRGB(0, 0, 0) or WHITE,
+	TextSize = 13,
+	Font = FONT_LABEL,
+	AutoButtonColor = false,
+	ZIndex = 5,
+	Parent = autoExecRow,
+})
+corner(autoExecBtn, 10)
+livingStroke(autoExecBtn, 1, true)
+autoExecBtn.MouseButton1Click:Connect(function()
+	local want = not config.autoExec
+	if want and CX.queueAutoExec then
+		local okQ = CX.queueAutoExec()
+		if not okQ then
+			showToast("AUTO EXECUTE", "No se pudo activar", "Tu executor no soporta queue_on_teleport o no hay script_key", WHITE)
+			return
+		end
+	end
+	config.autoExec = want
+	autoExecBtn.Text = config.autoExec and "ON" or "OFF"
+	tween(autoExecBtn, { BackgroundColor3 = config.autoExec and WHITE or BG_INPUT, TextColor3 = config.autoExec and Color3.fromRGB(0, 0, 0) or WHITE }, 0.25)
+	popButton(autoExecBtn)
+	saveConfig()
+end)
+
+local unloadRow = settingRow("Unload", "Completely remove the script")
+local unloadBtn = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -16, 0.5, 0),
+	Size = UDim2.new(0, 80, 0, 30),
+	BackgroundColor3 = BG_CHIP_OFF,
+	Text = "Unload",
+	TextColor3 = WHITE,
+	TextSize = 13,
+	Font = FONT_LABEL,
+	AutoButtonColor = false,
+	ZIndex = 5,
+	Parent = unloadRow,
+})
+corner(unloadBtn, 10)
+livingStroke(unloadBtn, 1, false)
+unloadBtn.MouseEnter:Connect(function() tween(unloadBtn, { BackgroundColor3 = BG_CHIP_ON, TextColor3 = WHITE }) end)
+unloadBtn.MouseLeave:Connect(function() tween(unloadBtn, { BackgroundColor3 = BG_CHIP_OFF, TextColor3 = SILVER }) end)
+unloadBtn.MouseButton1Click:Connect(function() ScreenGui:Destroy() end)
+
+access.applyLock = function()
+	if tabButtons.Users then tabButtons.Users.Visible = access.canUsers() end
+	if access.refreshCeboRow then pcall(access.refreshCeboRow) end
+end
+
+onAccessChanged = function()
+	if not hasPerm("autojoin") then
+		config.autoJoin = false
+		config.autoForce = false
+		if toggleRefresh.autoJoin then pcall(toggleRefresh.autoJoin) end
+		if toggleRefresh.autoForce then pcall(toggleRefresh.autoForce) end
+	end
+end
+
+
+end
+
+
+----------------------------------------------------------------
+-- STATUS PAGE: salud del finder en vivo (linea de tendencia de logs)
+----------------------------------------------------------------
+local StatusPage = create("Frame", {
+	Name = "StatusPage",
+	Size = UDim2.new(1, -32, 1, -32),
+	Position = UDim2.new(0, 16, 0, 16),
+	BackgroundTransparency = 1,
+	Visible = false,
+	ZIndex = 2,
+	Parent = Content,
+})
+create("UIPadding", { PaddingTop = UDim.new(0, 3), PaddingBottom = UDim.new(0, 3), PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 3), Parent = StatusPage })
+tabPages.Status = StatusPage
+
+create("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	Text = "Status",
+	TextColor3 = WHITE,
+	TextSize = 18,
+	Font = FONT_TITLE,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 3,
+	Parent = StatusPage,
+})
+create("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 20),
+	Position = UDim2.new(0, 0, 0, 34),
+	BackgroundTransparency = 1,
+	Text = "Salud del finder en tiempo real",
+	TextColor3 = SILVER,
+	TextSize = 12,
+	Font = FONT_VALUE,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 3,
+	Parent = StatusPage,
+})
+
+-- Ganchos que usa fetchEggs (se reemplazan al construir la pagina)
+access.statusFeed = function() end
+access.statusNew = function() end
+access.countLog = function() end
+access.statusBackfill = function() end
+
+access.buildStatus = function()
+	local N = 60          -- 60 puntos × 5s = 5 minutos de historial
+	local SAMPLE = 5      -- actualiza cada 5 segundos (línea + stats)
+	local CYCLE = 300     -- ciclo de 5 min alineado al reloj (:00 :05 :10 ... :55)
+	local GREEN = Color3.fromRGB(74, 222, 128)
+	local AMBER = Color3.fromRGB(250, 204, 21)
+	local RED = Color3.fromRGB(248, 113, 113)
+	local GRAY = SILVER
+	local LV = { ok = GREEN, warn = AMBER, bad = RED }
+	local function sz(a, b) return touchEnabled and a or b end
+
+	local st = {
+		samples = {},
+		news = {},
+		connected = false,
+		ready = false,
+		seenOk = false,
+		warm = false,
+		latest = 0,
+		totalNew = 0,     -- contador real de logs nuevos desde el arranque
+	}
+
+	local scroll = create("ScrollingFrame", {
+		Name = "StatusScroll",
+		Size = UDim2.new(1, 0, 1, -58),
+		Position = UDim2.new(0, 0, 0, 58),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = SILVER,
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		ZIndex = 3,
+		Parent = StatusPage,
+	})
+	create("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = scroll })
+	create("UIPadding", {
+		PaddingTop = UDim.new(0, 4),
+		PaddingLeft = UDim.new(0, 8),
+		PaddingRight = UDim.new(0, 14),
+		PaddingBottom = UDim.new(0, 10),
+		Parent = scroll,
+	})
+
+	local function panel(h, order)
+		local f = create("Frame", {
+			Size = UDim2.new(1, 0, 0, h),
+			BackgroundColor3 = Color3.fromRGB(14, 14, 14),
+			BackgroundTransparency = 0.08,
+			BorderSizePixel = 0,
+			LayoutOrder = order,
+			ZIndex = 4,
+			Parent = scroll,
+		})
+		corner(f, 10)
+		staticStroke(f, 1)
+		glass(f, 0.12)
+		return f
+	end
+
+	local function label(parent, props)
+		props.BackgroundTransparency = 1
+		props.ZIndex = props.ZIndex or 6
+		props.Parent = parent
+		return create("TextLabel", props)
+	end
+
+	-- 1) Banner de estado
+	local banner = panel(sz(54, 62), 1)
+	local bBar = create("Frame", {
+		Size = UDim2.new(0, 3, 1, -16),
+		Position = UDim2.new(0, 8, 0, 8),
+		BackgroundColor3 = GRAY,
+		BorderSizePixel = 0,
+		ZIndex = 6,
+		Parent = banner,
+	})
+	corner(bBar, 2)
+	local bTitle = label(banner, {
+		Size = UDim2.new(0.6, 0, 0, 20),
+		Position = UDim2.new(0, 22, 0, sz(8, 10)),
+		Text = "CONECTANDO",
+		TextColor3 = GRAY,
+		TextSize = sz(14, 17),
+		Font = FONT_TITLE,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+	local bDesc = label(banner, {
+		Size = UDim2.new(0.62, 0, 0, 14),
+		Position = UDim2.new(0, 22, 0, sz(29, 34)),
+		Text = "Esperando respuesta de Firebase...",
+		TextColor3 = SILVER,
+		TextSize = sz(9, 11),
+		Font = FONT_VALUE,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+	local bPct = label(banner, {
+		AnchorPoint = Vector2.new(1, 0),
+		Size = UDim2.new(0.28, 0, 0, 24),
+		Position = UDim2.new(1, -14, 0, sz(8, 10)),
+		Text = "--",
+		TextColor3 = GRAY,
+		TextSize = sz(16, 20),
+		Font = FONT_TITLE,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	})
+	label(banner, {
+		AnchorPoint = Vector2.new(1, 0),
+		Size = UDim2.new(0.28, 0, 0, 14),
+		Position = UDim2.new(1, -14, 0, sz(29, 34)),
+		Text = "vs promedio",
+		TextColor3 = SILVER,
+		TextSize = sz(8, 10),
+		Font = FONT_VALUE,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	})
+
+	-- 2) Tarjetas de metricas
+	local cardsRow = create("Frame", {
+		Size = UDim2.new(1, 0, 0, sz(44, 52)),
+		BackgroundTransparency = 1,
+		LayoutOrder = 2,
+		ZIndex = 4,
+		Parent = scroll,
+	})
+	create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = cardsRow,
+	})
+	local function makeCard(i, title)
+		local c = create("Frame", {
+			Size = UDim2.new(0.25, -6, 1, 0),
+			BackgroundColor3 = Color3.fromRGB(14, 14, 14),
+			BackgroundTransparency = 0.08,
+			BorderSizePixel = 0,
+			LayoutOrder = i,
+			ZIndex = 4,
+			Parent = cardsRow,
+		})
+		corner(c, 10)
+		staticStroke(c, 1)
+		glass(c, 0.12)
+		label(c, {
+			Size = UDim2.new(1, -12, 0, 12),
+			Position = UDim2.new(0, 8, 0, sz(6, 7)),
+			Text = title,
+			TextColor3 = SILVER,
+			TextSize = sz(8, 9),
+			Font = FONT_LABEL,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		})
+		return label(c, {
+			Size = UDim2.new(1, -12, 0, 22),
+			Position = UDim2.new(0, 8, 0, sz(20, 24)),
+			Text = "—",
+			TextColor3 = WHITE,
+			TextSize = sz(14, 18),
+			Font = FONT_TITLE,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		})
+	end
+	local cActive = makeCard(1, "LOGS ACTIVOS")
+	local cNew = makeCard(2, "TOTAL LOGS")
+	local cAvg = makeCard(3, "PROMEDIO")
+	local cTrend = makeCard(4, "TENDENCIA")
+
+	-- 3) Grafica de tendencia
+	local chartH = sz(176, 214)
+	local chart = panel(chartH, 3)
+	label(chart, {
+		Size = UDim2.new(0.6, 0, 0, 16),
+		Position = UDim2.new(0, 12, 0, 8),
+		Text = "Logs recibidos",
+		TextColor3 = WHITE,
+		TextSize = sz(11, 13),
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+	label(chart, {
+		Size = UDim2.new(0.7, 0, 0, 12),
+		Position = UDim2.new(0, 12, 0, sz(23, 25)),
+		Text = "Logs activos del juego · ciclo de 5 min",
+		TextColor3 = SILVER,
+		TextSize = sz(8, 10),
+		Font = FONT_VALUE,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+
+	local live = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 10),
+		Size = UDim2.new(0, 46, 0, 16),
+		BackgroundColor3 = BG_CHIP_ON,
+		BackgroundTransparency = 0.2,
+		BorderSizePixel = 0,
+		ZIndex = 6,
+		Parent = chart,
+	})
+	corner(live, 8)
+	staticStroke(live, 1)
+	local liveDot = create("Frame", {
+		Size = UDim2.new(0, 6, 0, 6),
+		Position = UDim2.new(0, 8, 0.5, -3),
+		BackgroundColor3 = GRAY,
+		BorderSizePixel = 0,
+		ZIndex = 7,
+		Parent = live,
+	})
+	corner(liveDot, 3)
+	label(live, {
+		Size = UDim2.new(1, -18, 1, 0),
+		Position = UDim2.new(0, 18, 0, 0),
+		Text = "LIVE",
+		TextColor3 = WHITE,
+		TextSize = 9,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ZIndex = 7,
+	})
+
+	local plotTop = sz(44, 48)
+	local plotBottom = 26
+	local plot = create("Frame", {
+		Name = "Plot",
+		Size = UDim2.new(1, -58, 1, -(plotTop + plotBottom)),
+		Position = UDim2.new(0, 46, 0, plotTop),
+		BackgroundTransparency = 1,
+		ZIndex = 5,
+		Parent = chart,
+	})
+
+	local yLbls = {}
+	for i = 1, 3 do
+		yLbls[i] = label(chart, {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Size = UDim2.new(0, 36, 0, 12),
+			Position = UDim2.new(0, 6, 0, plotTop),
+			Text = "",
+			TextColor3 = SILVER,
+			TextSize = sz(8, 9),
+			Font = FONT_VALUE,
+			TextXAlignment = Enum.TextXAlignment.Right,
+		})
+	end
+
+	for i = 0, 3 do
+		create("Frame", {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Size = UDim2.new(1, 0, 0, 1),
+			Position = UDim2.new(0, 0, i / 3, 0),
+			BackgroundColor3 = WHITE,
+			BackgroundTransparency = i == 3 and 0.8 or 0.92,
+			BorderSizePixel = 0,
+			ZIndex = 5,
+			Parent = plot,
+		})
+	end
+
+	local xRow = create("Frame", {
+		Size = UDim2.new(1, -58, 0, 14),
+		Position = UDim2.new(0, 46, 1, -22),
+		BackgroundTransparency = 1,
+		ZIndex = 5,
+		Parent = chart,
+	})
+	local xTexts = { { "-5 min", Enum.TextXAlignment.Left }, { "-2.5 min", Enum.TextXAlignment.Center }, { "ahora", Enum.TextXAlignment.Right } }
+	local xLbls = {}
+	for _, t in ipairs(xTexts) do
+		xLbls[#xLbls + 1] = label(xRow, {
+			Size = UDim2.new(1, 0, 1, 0),
+			Text = t[1],
+			TextColor3 = SILVER,
+			TextSize = sz(8, 9),
+			Font = FONT_VALUE,
+			TextXAlignment = t[2],
+		})
+	end
+
+	local emptyLbl = label(plot, {
+		Size = UDim2.new(1, 0, 1, 0),
+		Text = "Reuniendo datos…",
+		TextColor3 = SILVER,
+		TextSize = sz(10, 12),
+		Font = FONT_VALUE,
+	})
+
+	local segs = {}
+	for i = 1, N do
+		local seg = create("Frame", {
+			Name = "Seg",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			BackgroundColor3 = GREEN,
+			BorderSizePixel = 0,
+			Visible = false,
+			ZIndex = 7,
+			Parent = plot,
+		})
+		corner(seg, 1)
+		segs[i] = seg
+	end
+
+	local avgLine = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Size = UDim2.new(1, 0, 0, 1),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		BackgroundColor3 = WHITE,
+		BackgroundTransparency = 0.7,
+		BorderSizePixel = 0,
+		Visible = false,
+		ZIndex = 6,
+		Parent = plot,
+	})
+	label(avgLine, {
+		AnchorPoint = Vector2.new(1, 1),
+		Size = UDim2.new(0, 60, 0, 10),
+		Position = UDim2.new(1, -2, 0, -2),
+		Text = "PROMEDIO",
+		TextColor3 = SILVER,
+		TextSize = 8,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	})
+
+	local ring = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = UDim2.new(0, 16, 0, 16),
+		BackgroundColor3 = GREEN,
+		BackgroundTransparency = 0.75,
+		BorderSizePixel = 0,
+		Visible = false,
+		ZIndex = 8,
+		Parent = plot,
+	})
+	corner(ring, 8)
+	local dot = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = UDim2.new(0, 7, 0, 7),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		Visible = false,
+		ZIndex = 9,
+		Parent = plot,
+	})
+	corner(dot, 4)
+
+	-- Logica de datos
+	local function mean(a, i, j)
+		local s, c = 0, 0
+		for k = math.max(i, 1), j do
+			if a[k] then
+				s += a[k]
+				c += 1
+			end
+		end
+		return c > 0 and s / c or 0
+	end
+
+	local function levelOf(v, avg)
+		if v <= 0 then return "bad" end
+		if avg <= 0 then return "ok" end
+		local r = v / avg
+		if r >= 0.8 then return "ok" end
+		if r >= 0.4 then return "warn" end
+		return "bad"
+	end
+
+	local function niceMax(v)
+		if v <= 5 then return 5 end
+		local mag = 10 ^ math.floor(math.log10(v))
+		local f = v / mag
+		local nf = (f <= 1 and 1) or (f <= 2 and 2) or (f <= 5 and 5) or 10
+		return nf * mag
+	end
+
+	local function newPerMin()
+		local nowc = os.clock()
+		local c = 0
+		for i = #st.news, 1, -1 do
+			if nowc - st.news[i].t <= 60 then
+				c += st.news[i].n
+			else
+				table.remove(st.news, i)
+			end
+		end
+		return c
+	end
+
+	local function computeState()
+		local n = #st.samples
+		if not st.ready then
+			return "wait", "CONECTANDO", "Esperando respuesta de Firebase...", GRAY, nil
+		end
+		if not st.connected then
+			return "bad", "SIN CONEXIÓN", "No hay conexión con Firebase. Reintentando...", RED, nil
+		end
+		if n < 6 then
+			return "wait", "CALIBRANDO", "Reuniendo datos de rendimiento (1 min)...", GRAY, nil
+		end
+		local cur = mean(st.samples, n - 2, n)
+		local avg = mean(st.samples, 1, n)
+		local ratio = avg > 0 and cur / avg or 1
+		local pct = (ratio - 1) * 100
+		if cur <= 0 then
+			return "bad", "SIN LOGS", "No llegan logs de este juego. Revisa los scanners y Firebase.", RED, pct
+		elseif ratio < 0.4 then
+			return "bad", "CRÍTICO", "La entrada de logs cayó fuerte. Posible caída de scanners o lag.", RED, pct
+		elseif ratio < 0.8 then
+			return "warn", "BAJANDO", "Entran menos logs de lo normal. Vigila los scanners.", AMBER, pct
+		elseif pct >= 10 then
+			return "ok", "EN ALZA", "Los logs están subiendo. Todo funciona muy bien.", GREEN, pct
+		end
+		return "ok", "ÓPTIMO", "El finder recibe logs con normalidad.", GREEN, pct
+	end
+
+	local function redraw()
+		if not StatusPage.Visible then return end
+		local abs = plot.AbsoluteSize
+		if abs.X < 10 or abs.Y < 10 then return end
+		local aspect = abs.X / abs.Y
+		local n = #st.samples
+
+		for i = 1, N do
+			segs[i].Visible = false
+		end
+		emptyLbl.Visible = n < 2
+		ring.Visible = n >= 1
+		dot.Visible = n >= 1
+
+		local maxv, sum = 0, 0
+		for _, v in ipairs(st.samples) do
+			if v > maxv then maxv = v end
+			sum += v
+		end
+		local avg = n > 0 and sum / n or 0
+		local top = niceMax(maxv * 1.15)
+
+		local plotH = chartH - (plotTop + plotBottom)
+		yLbls[1].Text = tostring(top)
+		yLbls[2].Text = tostring(math.floor(top / 2 + 0.5))
+		yLbls[3].Text = "0"
+		yLbls[1].Position = UDim2.new(0, 6, 0, plotTop)
+		yLbls[2].Position = UDim2.new(0, 6, 0, plotTop + plotH / 2)
+		yLbls[3].Position = UDim2.new(0, 6, 0, plotTop + plotH)
+
+		local stepX = 1 / (N - 1)
+		local prevX, prevY
+		local lastX, lastY, lastCol = 1, 1, GREEN
+		for k = 1, n do
+			local v = st.samples[k]
+			local x = (k - 1) * stepX
+			local y = 1 - math.clamp(v / top, 0, 1)
+			local col = LV[levelOf(v, avg)]
+
+			if prevX then
+				local dxH = (x - prevX) * aspect
+				local dyH = y - prevY
+				local len = math.sqrt(dxH * dxH + dyH * dyH)
+				local seg = segs[k]
+				seg.Visible = true
+				seg.BackgroundColor3 = col
+				seg.Position = UDim2.new((x + prevX) / 2, 0, (y + prevY) / 2, 0)
+				seg.Size = UDim2.new(len / aspect, 1, 0, 2)
+				seg.Rotation = math.deg(math.atan2(dyH, dxH))
+			end
+			prevX, prevY = x, y
+			lastX, lastY, lastCol = x, y, col
+		end
+
+		if n >= 1 then
+			ring.Position = UDim2.new(lastX, 0, lastY, 0)
+			dot.Position = UDim2.new(lastX, 0, lastY, 0)
+			ring.BackgroundColor3 = lastCol
+			ring.BackgroundTransparency = 0.75
+		end
+
+		if n >= 6 then
+			avgLine.Visible = true
+			avgLine.Position = UDim2.new(0, 0, 1 - math.clamp(avg / top, 0, 1), 0)
+		else
+			avgLine.Visible = false
+		end
+	end
+
+	local function fmtTotal(v)
+		local t = tostring(math.floor(v))
+		t = t:reverse():gsub("(%d%d%d)", "%1."):reverse()
+		t = t:gsub("^%.", "")
+		return t
+	end
+
+	local function updateTotal()
+		local b = httpGet("/logtotal.json")
+		local v = b and tonumber(b)
+		if v then
+			st.total = v
+			if st.ready and st.connected then
+				cNew.Text = fmtTotal(v)
+			end
+		end
+	end
+
+	local function refreshAll()
+		local n = #st.samples
+		local level, title, desc, col, pct = computeState()
+
+		bTitle.Text = title
+		bDesc.Text = desc
+		bTitle.TextColor3 = col
+		bBar.BackgroundColor3 = col
+		liveDot.BackgroundColor3 = col
+		if pct then
+			bPct.Text = string.format("%+d%%", math.clamp(math.floor(pct + 0.5), -999, 999))
+			bPct.TextColor3 = col
+		else
+			bPct.Text = "--"
+			bPct.TextColor3 = GRAY
+		end
+
+		local live_ = st.ready and st.connected
+		cActive.Text = live_ and tostring(st.latest) or "—"
+		cNew.Text = (live_ and st.total) and fmtTotal(st.total) or "—"
+		cAvg.Text = n > 0 and tostring(math.floor(mean(st.samples, 1, n) + 0.5)) or "—"
+
+		local trendTxt, trendCol = "—", WHITE
+		if live_ and n >= 8 then
+			local recent = mean(st.samples, n - 2, n)
+			local earlier = mean(st.samples, n - 7, n - 3)
+			local r = earlier > 0 and recent / earlier or (recent > 0 and 2 or 1)
+			if r >= 1.1 then
+				trendTxt, trendCol = "Alcista", GREEN
+			elseif r <= 0.9 then
+				trendTxt, trendCol = "Bajista", RED
+			else
+				trendTxt, trendCol = "Estable", WHITE
+			end
+		end
+		cTrend.Text = trendTxt
+		cTrend.TextColor3 = trendCol
+
+		local cs = (st.cycle or math.floor(os.time() / CYCLE)) * CYCLE
+		xLbls[1].Text = os.date("%H:%M", cs)
+		xLbls[2].Text = os.date("%H:%M:%S", cs + CYCLE / 2)
+		xLbls[3].Text = os.date("%H:%M", cs + CYCLE)
+
+		task.spawn(updateTotal)
+		redraw()
+	end
+
+	local function push(v)
+		local t = os.time()
+		local cyc = math.floor(t / CYCLE)
+		if st.cycle ~= cyc then
+			st.cycle = cyc
+			st.samples = {}
+		end
+		local slot = math.clamp(math.floor((t - cyc * CYCLE) / SAMPLE) + 1, 1, N)
+		while #st.samples < slot - 1 do
+			table.insert(st.samples, st.samples[#st.samples] or v)
+		end
+		st.samples[slot] = v
+	end
+
+	access.statusFeed = function(connected, alive)
+		st.connected = connected and true or false
+		if connected then
+			st.latest = tonumber(alive) or 0
+			if st.seenOk then st.warm = true end
+			st.seenOk = true
+			if not st.backfilled and access.fetchBackfill then
+				st.backfilled = true
+				task.spawn(access.fetchBackfill)
+			end
+		end
+		if not st.ready then
+			st.ready = true
+			push(st.connected and st.latest or 0)
+			if StatusPage.Visible then refreshAll() end
+		end
+	end
+
+	access.statusNew = function(n)
+		n = tonumber(n) or 0
+		if st.warm and n > 0 then
+			table.insert(st.news, { t = os.clock(), n = n })
+			st.totalNew = (st.totalNew or 0) + n
+			-- limpiar viejos (> 60s)
+			local nowc = os.clock()
+			for i = #st.news, 1, -1 do
+				if nowc - st.news[i].t > 60 then
+					table.remove(st.news, i)
+				end
+			end
+		end
+	end
+
+	-- Reconstruye la grafica desde el inicio del ciclo de 5 min con los logs ya guardados en Firebase
+	access.statusBackfill = function(data)
+		if type(data) ~= "table" then return end
+		local t = os.time()
+		local cyc = math.floor(t / CYCLE)
+		local cycStart = cyc * CYCLE
+		local curSlot = math.clamp(math.floor((t - cycStart) / SAMPLE) + 1, 1, N)
+		if st.cycle ~= cyc then
+			st.cycle = cyc
+			st.samples = {}
+		end
+		local list = {}
+		for _, egg in pairs(data) do
+			if type(egg) == "table" and egg.eggUid and tonumber(egg.placeId) == access.PLACE_ID then
+				local last = tonumber(egg.lastSeen) or 0
+				list[#list + 1] = { tonumber(egg.spawnedAt) or last, last }
+			end
+		end
+		for slot = 1, curSlot - 1 do
+			local ts = cycStart + (slot - 1) * SAMPLE
+			local c = 0
+			for _, e in ipairs(list) do
+				if e[1] <= ts and e[2] >= ts - STALE_SEC then c += 1 end
+			end
+			st.samples[slot] = c
+		end
+		if StatusPage.Visible then pcall(refreshAll) end
+	end
+
+	-- Contador historico: +1 por cada log nuevo (una sola vez por log aunque haya varios Finders)
+	local countQueue = {}
+	local countRunning = false
+	access.countLog = function(key)
+		if not key or key == "" then return end
+		countQueue[#countQueue + 1] = tostring(key)
+		if countRunning then return end
+		countRunning = true
+		task.spawn(function()
+			while #countQueue > 0 do
+				local k = table.remove(countQueue, 1)
+				pcall(httpSend, "PATCH", "/.json", {
+					["logcounted/" .. k] = true,
+					["logproof"] = FEED_SECRET,
+					["logtotal"] = { [".sv"] = { increment = 1 } },
+				})
+			end
+			countRunning = false
+		end)
+	end
+
+	task.spawn(function()
+		while ScreenGui and ScreenGui.Parent do
+			task.wait(SAMPLE) -- 2 segundos
+			if st.ready then
+				push(st.connected and st.latest or 0)
+				if StatusPage.Visible and Main.Visible then
+					pcall(refreshAll)
+				end
+			end
+		end
+	end)
+
+	Main:GetPropertyChangedSignal("Visible"):Connect(function()
+		if Main.Visible and StatusPage.Visible then
+			task.defer(function() pcall(refreshAll) end)
+		end
+	end)
+	StatusPage:GetPropertyChangedSignal("Visible"):Connect(function()
+		if StatusPage.Visible then
+			task.defer(function() pcall(refreshAll) end)
+		end
+	end)
+	plot:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		if StatusPage.Visible then pcall(redraw) end
+	end)
+
+	refreshAll()
+end
+do
+	local okBuild, errBuild = pcall(access.buildStatus)
+	if not okBuild then
+		warn("[CeboFinder] Error al construir Status:", errBuild)
+	end
+end
+
+
+-- Notifications
+local notifContainer = create("Frame", {
+	Name = "RightNotifContainer",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -12, 0, 18),
+	Size = UDim2.new(0, 220, 1, -40),
+	BackgroundTransparency = 1,
+	ZIndex = 220,
+	Parent = ScreenGui,
+})
+create("UIListLayout", {
+	VerticalAlignment = Enum.VerticalAlignment.Top,
+	HorizontalAlignment = Enum.HorizontalAlignment.Right,
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Padding = UDim.new(0, 8),
+	Parent = notifContainer,
+})
+
+local notifCount = 0
+showToast = function(title, name, sub, col)
+	notifCount += 1
+	local order = notifCount
+	col = col or WHITE
+	local toastH = (sub ~= nil and tostring(sub) ~= "") and 68 or 54
+	local wrapper = create("Frame", {
+		Name = "JoinNotifWrapper",
+		Size = UDim2.new(0, 220, 0, toastH),
+		BackgroundTransparency = 1,
+		ClipsDescendants = false,
+		ZIndex = 220,
+		LayoutOrder = -order,
+		Parent = notifContainer,
+	})
+	local card = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, 60, 0, 0),
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundColor3 = BG_MAIN,
+		BackgroundTransparency = 0.05,
+		BorderSizePixel = 0,
+		ZIndex = 220,
+		Parent = wrapper,
+	})
+	corner(card, 12)
+	local stroke = livingStroke(card, 1.5, true)
+	local bar = create("Frame", {
+		Size = UDim2.new(0, 4, 1, -16),
+		Position = UDim2.new(0, 10, 0, 8),
+		BackgroundColor3 = col,
+		BorderSizePixel = 0,
+		ZIndex = 221,
+		Parent = card,
+	})
+	corner(bar, 1)
+	create("TextLabel", {
+		Size = UDim2.new(1, -32, 0, 14),
+		Position = UDim2.new(0, 22, 0, 10),
+		BackgroundTransparency = 1,
+		Text = tostring(title or ""),
+		TextColor3 = col,
+		TextSize = 11,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ZIndex = 221,
+		Parent = card,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(1, -32, 0, 18),
+		Position = UDim2.new(0, 22, 0, 26),
+		BackgroundTransparency = 1,
+		Text = tostring(name or "Unknown"),
+		TextColor3 = WHITE,
+		TextSize = 14,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 221,
+		Parent = card,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(1, -32, 0, 14),
+		Position = UDim2.new(0, 22, 0, 47),
+		BackgroundTransparency = 1,
+		Text = tostring(sub or ""),
+		TextColor3 = col,
+		TextSize = 12,
+		Font = FONT_VALUE,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 221,
+		Parent = card,
+	})
+	tween(card, { Position = UDim2.new(1, 0, 0, 0) }, 0.4, Enum.EasingStyle.Back)
+	task.delay(3.5, function()
+		tween(card, { Position = UDim2.new(1, 60, 0, 0), BackgroundTransparency = 1 }, 0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+		tween(stroke, { Transparency = 1 }, 0.35)
+		for _, d in ipairs(card:GetDescendants()) do
+			if d:IsA("TextLabel") then
+				tween(d, { TextTransparency = 1 }, 0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+			elseif d:IsA("Frame") then
+				tween(d, { BackgroundTransparency = 1 }, 0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+			end
+		end
+		tween(wrapper, { Size = UDim2.new(0, 280, 0, 0) }, 0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+		task.delay(0.4, function()
+			if wrapper and wrapper.Parent then wrapper:Destroy() end
+		end)
+	end)
+end
+
+joinNotifFn = function(name, mps)
+	showToast("JOINING", name, formatValue(mps), valueColor(mps, false))
+end
+
+-- Log Notifications: pop-up con foto del pet; click = JOIN (sin abrir el Finder)
+-- Sin limite: cada log muestra su pop-up al instante
+local activeLogNotifs = 0
+local MAX_LOG_NOTIFS = (touchEnabled or viewportSize.X < 900) and 3 or 5
+local liveNotifs = {} -- funciones dismiss, la mas vieja primero
+
+-- Notificaciones ya mostradas (se guardan en archivo: al re-ejecutar NO se repiten)
+CX.notified = {}
+CX.notifiedDirty = false
+do
+	local NOTIF_FILE = "CeboFinder_Notified.json"
+	local nowTs = os.time()
+	if readfile and isfile and isfile(NOTIF_FILE) then
+		pcall(function()
+			local d = HttpService:JSONDecode(readfile(NOTIF_FILE))
+			if type(d) == "table" then
+				for uid, ts in pairs(d) do
+					if type(ts) == "number" and nowTs - ts < 900 then CX.notified[tostring(uid)] = ts end
+				end
+			end
+		end)
+	end
+	task.spawn(function()
+		while ScreenGui and ScreenGui.Parent do
+			task.wait(2)
+			if CX.notifiedDirty and writefile then
+				CX.notifiedDirty = false
+				local t = os.time()
+				for uid, ts in pairs(CX.notified) do
+					if t - ts >= 900 then CX.notified[uid] = nil end
+				end
+				pcall(function() writefile(NOTIF_FILE, HttpService:JSONEncode(CX.notified)) end)
+			end
+		end
+	end)
+end
+
+logNotifFn = function(data)
+	local nUid = tostring(data.eggUid or "")
+	if nUid ~= "" then
+		if CX.notified[nUid] then return end
+		CX.notified[nUid] = os.time()
+		CX.notifiedDirty = true
+	end
+	-- Tope: si ya hay el maximo, se elimina la mas vieja (la de abajo) y la nueva entra arriba
+	while #liveNotifs >= MAX_LOG_NOTIFS do
+		local oldest = table.remove(liveNotifs, 1)
+		if oldest then pcall(oldest) end
+	end
+	activeLogNotifs += 1
+	notifCount += 1
+	local order = notifCount
+	local col = valueColor(data.mps, data.og)
+	local wrapper = create("Frame", {
+		Name = "LogNotifWrapper",
+		Size = UDim2.new(0, 220, 0, 58),
+		BackgroundTransparency = 1,
+		ClipsDescendants = false,
+		ZIndex = 220,
+		LayoutOrder = -order,
+		Parent = notifContainer,
+	})
+	local card = create("Frame", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, 60, 0, 0),
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundColor3 = BG_MAIN,
+		BackgroundTransparency = 0.05,
+		BorderSizePixel = 0,
+		ZIndex = 220,
+		Parent = wrapper,
+	})
+	corner(card, 12)
+	local stroke = livingStroke(card, 1.5, true)
+	local bar = create("Frame", {
+		Size = UDim2.new(0, 4, 1, -16),
+		Position = UDim2.new(0, 10, 0, 8),
+		BackgroundColor3 = col,
+		BorderSizePixel = 0,
+		ZIndex = 221,
+		Parent = card,
+	})
+	corner(bar, 1)
+	create("ImageLabel", {
+		Size = UDim2.new(0, 36, 0, 36),
+		Position = UDim2.new(0, 14, 0.5, -18),
+		BackgroundTransparency = 1,
+		Image = tostring(data.icon or ""),
+		ScaleType = Enum.ScaleType.Fit,
+		ZIndex = 221,
+		Parent = card,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(1, -70, 0, 12),
+		Position = UDim2.new(0, 56, 0, 6),
+		BackgroundTransparency = 1,
+		Text = "NEW LOG  ·  click",
+		TextColor3 = col,
+		TextSize = 10,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ZIndex = 221,
+		Parent = card,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(1, -70, 0, 16),
+		Position = UDim2.new(0, 56, 0, 20),
+		BackgroundTransparency = 1,
+		Text = tostring(data.name or "Unknown") .. "  [ " .. formatValue(data.mps) .. " ]",
+		TextColor3 = WHITE,
+		TextSize = 12,
+		Font = FONT_LABEL,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 221,
+		Parent = card,
+	})
+	local cur, maxP = tonumber(data.players), tonumber(data.maxPlayers)
+	local info = "Players " .. (cur and tostring(cur) or "?") .. "/" .. (maxP and tostring(maxP) or "?")
+	if data.spawnedAt then info = info .. "  -  " .. spawnAge(data.spawnedAt) end
+	local mdText = CX.mutDisplay(data)
+	if mdText ~= "" then
+		info = info .. "  -  " .. mdText
+	end
+	create("TextLabel", {
+		Size = UDim2.new(1, -70, 0, 12),
+		Position = UDim2.new(0, 56, 0, 38),
+		BackgroundTransparency = 1,
+		Text = info,
+		TextColor3 = col,
+		TextSize = 10,
+		Font = FONT_VALUE,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 221,
+		Parent = card,
+	})
+	local clickBtn = create("TextButton", {
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		ZIndex = 230,
+		Parent = card,
+	})
+	local closing = false
+	local function dismiss()
+		if closing then return end
+		closing = true
+		activeLogNotifs = math.max(0, activeLogNotifs - 1)
+		tween(card, { Position = UDim2.new(1, 50, 0, 0), BackgroundTransparency = 1 }, 0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+		tween(stroke, { Transparency = 1 }, 0.35)
+		tween(wrapper, { Size = UDim2.new(0, 280, 0, 0) }, 0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+		for i = #liveNotifs, 1, -1 do
+			if liveNotifs[i] == dismiss then table.remove(liveNotifs, i) end
+		end
+		task.delay(0.4, function()
+			if wrapper and wrapper.Parent then wrapper:Destroy() end
+		end)
+	end
+	liveNotifs[#liveNotifs + 1] = dismiss
+	clickBtn.MouseButton1Click:Connect(function()
+		teleport(data.jobId, data.placeId)
+		dismiss()
+	end)
+	tween(card, { Position = UDim2.new(1, 0, 0, 0) }, 0.4, Enum.EasingStyle.Back)
+	task.delay(6, dismiss)
+end
+
+local lastDeny = 0
+denyNotifyFn = function(feature)
+	if os.clock() - lastDeny < 2 then return end
+	lastDeny = os.clock()
+	showToast("SIN PERMISO", tostring(feature), "El owner no te dio acceso", WHITE)
+end
+
+do
+-- Announcements
+local annMinH = touchEnabled and 90 or 78
+local annMaxH = math.min(touchEnabled and 260 or 320, math.floor(viewportSize.Y * 0.55))
+local function annMaxW() return math.min(780, viewportSize.X * 0.9) end
+
+local AnnFrame = create("Frame", {
+	Name = "AnnouncementTopFrame",
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, -120),
+	Size = UDim2.new(0.9, 0, 0, annMinH),
+	BackgroundColor3 = BG_MAIN,
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ZIndex = 998,
+	Visible = false,
+	Parent = ScreenGui,
+})
+corner(AnnFrame, 12)
+create("UISizeConstraint", { MaxSize = Vector2.new(780, annMaxH), Parent = AnnFrame })
+local annStroke = livingStroke(AnnFrame, 1.5, true)
+annStroke.Transparency = 1
+local annGlow = create("ImageLabel", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.new(0.5, 0, 0.5, 0),
+	Size = UDim2.new(1, 80, 1, 80),
+	BackgroundTransparency = 1,
+	Image = "rbxassetid://5028857084",
+	ImageColor3 = WHITE,
+	ImageTransparency = 1,
+	ZIndex = 997,
+	Parent = AnnFrame,
+})
+local annTopBar = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, 8),
+	Size = UDim2.new(0, 50, 0, 2),
+	BackgroundColor3 = WHITE,
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ZIndex = 999,
+	Parent = AnnFrame,
+})
+corner(annTopBar, 1)
+local annBotBar = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 1),
+	Position = UDim2.new(0.5, 0, 1, -8),
+	Size = UDim2.new(0, 50, 0, 2),
+	BackgroundColor3 = WHITE,
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ZIndex = 999,
+	Parent = AnnFrame,
+})
+corner(annBotBar, 1)
+local annScroll = create("ScrollingFrame", {
+	Name = "AnnouncementScrollArea",
+	Size = UDim2.new(1, -32, 1, -28),
+	Position = UDim2.new(0, 16, 0, 14),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 3,
+	ScrollBarImageColor3 = WHITE,
+	ScrollBarImageTransparency = 0.3,
+	CanvasSize = UDim2.new(0, 0, 0, 0),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	ZIndex = 999,
+	Parent = AnnFrame,
+})
+local annText = create("TextLabel", {
+	Name = "AnnouncementTextTop",
+	Size = UDim2.new(1, -6, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	Position = UDim2.new(0, 0, 0, 0),
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = WHITE,
+	TextSize = touchEnabled and 30 or 26,
+	Font = FONT_TITLE,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	TextTransparency = 1,
+	TextStrokeTransparency = 1,
+	TextStrokeColor3 = Color3.fromRGB(0, 0, 0),
+	ZIndex = 999,
+	Parent = annScroll,
+})
+
+local function getTextHeight(txt)
+	local w = annMaxW() - 38
+	local ok, sz = pcall(function()
+		return TextService:GetTextSize(txt, annText.TextSize, annText.Font, Vector2.new(math.max(w, 50), math.huge))
+	end)
+	if ok and sz then return sz.Y end
+	return annMinH - 28
+end
+
+local function showAnnouncement(msg)
+	local text = tostring(msg or ""):gsub("\r", "")
+	if text == "" then return end
+	annText.Text = text
+	annScroll.CanvasPosition = Vector2.new(0, 0)
+	local h = math.clamp(getTextHeight(text) + 28, annMinH, annMaxH)
+	local words = 0
+	for _ in text:gmatch("%S+") do words += 1 end
+	local duration = math.clamp(8 + math.floor(words / 8), 8, 18)
+	AnnFrame.Visible = true
+	AnnFrame.Size = UDim2.new(0.9, 0, 0, h)
+	AnnFrame.Position = UDim2.new(0.5, 0, 0, -(h + 40))
+	AnnFrame.BackgroundTransparency = 1
+	annStroke.Transparency = 1
+	annGlow.ImageTransparency = 1
+	annTopBar.BackgroundTransparency = 1
+	annBotBar.BackgroundTransparency = 1
+	annTopBar.Size = UDim2.new(0, 50, 0, 2)
+	annBotBar.Size = UDim2.new(0, 50, 0, 2)
+	annText.TextTransparency = 1
+	annText.TextStrokeTransparency = 1
+	tween(AnnFrame, { Position = UDim2.new(0.5, 0, 0, touchEnabled and 20 or 16), BackgroundTransparency = 0.05 }, 0.55, Enum.EasingStyle.Back)
+	tween(annStroke, { Transparency = 0.2 }, 0.4)
+	tween(annGlow, { ImageTransparency = 0.6 }, 0.5)
+	tween(annTopBar, { BackgroundTransparency = 0.1, Size = UDim2.new(0, 110, 0, 2) }, 0.55, Enum.EasingStyle.Quint)
+	tween(annBotBar, { BackgroundTransparency = 0.1, Size = UDim2.new(0, 110, 0, 2) }, 0.55, Enum.EasingStyle.Quint)
+	tween(annText, { TextTransparency = 0, TextStrokeTransparency = 0.7 }, 0.45, Enum.EasingStyle.Quint)
+	task.delay(duration, function()
+		if annText.Text == text then
+			tween(AnnFrame, { Position = UDim2.new(0.5, 0, 0, -(h + 40)), BackgroundTransparency = 1 }, 0.45, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+			tween(annStroke, { Transparency = 1 }, 0.35)
+			tween(annGlow, { ImageTransparency = 1 }, 0.35)
+			tween(annTopBar, { BackgroundTransparency = 1, Size = UDim2.new(0, 50, 0, 2) }, 0.35)
+			tween(annBotBar, { BackgroundTransparency = 1, Size = UDim2.new(0, 50, 0, 2) }, 0.35)
+			tween(annText, { TextTransparency = 1, TextStrokeTransparency = 1 }, 0.35)
+			task.delay(0.5, function()
+				if annText.Text == text then AnnFrame.Visible = false end
+			end)
+		end
+	end)
+end
+
+end
+
+----------------------------------------------------------------
+-- Firebase Poll → Logs (nativo)
+----------------------------------------------------------------
+local seenEggs = {} -- eggUid → lastAdded timestamp
+local lastContentSig = "" -- firma de CONTENIDO (ignora lastSeen) → evita lag cada poll
+local pendingResort = false
+
+local function mapEggToEntry(egg)
+	local mut = tostring(egg.mutation or egg.rarityName or "")
+	return {
+		name = tostring(egg.eggName or "Unknown"),
+		icon = tostring(egg.eggIcon or ""),
+		mps = tonumber(egg.value) or 0,
+		jobId = tostring(egg.jobId or ""),
+		placeId = tonumber(egg.placeId),
+		players = tonumber(egg.players),
+		maxPlayers = tonumber(egg.maxPlayers),
+		spawnedAt = tonumber(egg.spawnedAt),
+		mutation = mut,
+		rarityName = tostring(egg.rarityName or ""),
+		effect = tostring(egg.effect or ""),
+		og = false,
+		eggUid = tostring(egg.eggUid),
+		silent = false,
+	}
+end
+
+-- Firma de un entry (sin lastSeen / spawnedAge)
+-- SIN players: 7/5 cambia todo el rato y NO debe invalidar contentSig (causaba lag)
+local function eggSig(entry)
+	return tostring(entry.eggUid or "")
+		.. "|" .. tostring(math.floor(tonumber(entry.mps) or 0))
+		.. "|" .. tostring(entry.mutation or "")
+		.. "|" .. tostring(entry.name or "")
+		.. "|" .. tostring(entry.effect or "")
+end
+
+local function pruneGone(alive)
+	local removed = false
+	for uid, ui in pairs(entryUi) do
+		if not alive[uid] then
+			entryUi[uid] = nil
+			seenEggs[uid] = nil
+			removeEntry(ui.wrapper)
+			removed = true
+		end
+	end
+	for uid in pairs(seenEggs) do
+		if type(uid) == "string" and not string.find(uid, "^sec:") and not alive[uid] then
+			seenEggs[uid] = nil
+		end
+	end
+	return removed
+end
+
+local function flushResort()
+	if not pendingResort then return end
+	pendingResort = false
+	resortFeed()
+	updateCanvas(feedScroll, feedLayout)
+	recountDetected()
+end
+
+-- Descarga SOLO los eggs recientes (orderBy lastSeen + endAt secret) = respuesta minuscula.
+-- Requiere ".indexOn": ["lastSeen"] en /eggs en las reglas de Firebase.
+-- Si no hay indice, cae automaticamente al metodo completo (como antes).
+local eggsIndexed = true
+local function fetchEggsBody()
+	if eggsIndexed then
+		local since = os.time() - STALE_SEC - 10
+		local b = httpGet("/eggs.json?orderBy=%22lastSeen%22&startAt=" .. tostring(since) .. "&endAt=%22" .. FEED_SECRET .. "%22")
+		if b == nil then return nil end
+		if not b:find("\"error\"", 1, true) then
+			return b
+		end
+		eggsIndexed = false -- sin indice: usar descarga completa
+	end
+	return httpGet("/eggs.json")
+end
+
+-- Descarga los eggs desde el inicio del ciclo de 5 min (con margen STALE_SEC) para la grafica de Status
+access.fetchBackfill = function()
+	local cycStart = math.floor(os.time() / 300) * 300
+	local b = httpGet("/eggs.json?orderBy=%22lastSeen%22&startAt=" .. tostring(cycStart - STALE_SEC - 10) .. "&endAt=%22" .. FEED_SECRET .. "%22")
+	if b == nil or b == "" or b:find("\"error\"", 1, true) then return end
+	local data = {}
+	if b ~= "null" then
+		local ok, dec = pcall(function() return HttpService:JSONDecode(b) end)
+		if not ok or type(dec) ~= "table" then return end
+		data = dec
+	end
+	pcall(access.statusBackfill, data)
+end
+
+-- Cola: los logs nuevos aparecen UNO POR UNO (rapido) con su animacion.
+-- Antes solo se mostraban 8 por poll y el resto se perdia.
+local spawnQueue = {}
+local aliveNow = {}
+local queueRunning = false
+local function runQueue()
+	if queueRunning then return end
+	queueRunning = true
+	task.spawn(function()
+		while #spawnQueue > 0 and ScreenGui and ScreenGui.Parent do
+			local entry = table.remove(spawnQueue, 1)
+			if entry and aliveNow[entry.eggUid] then
+				pcall(addEntry, entry)
+			end
+		end
+		queueRunning = false
+	end)
+end
+
+local function fetchEggs()
+	if not access.owner and not access.unlocked then return end
+	local body = fetchEggsBody()
+	if body == nil then
+		setStatus(false, "Offline")
+		pcall(access.statusFeed, false, 0)
+		return
+	end
+	if body == "null" or body == "" then
+		setStatus(true, "Connected")
+		pcall(access.statusFeed, true, 0)
+		aliveNow = {}
+		CX.lastFresh = {}
+		CX.lastFbKeys = {}
+		if lastContentSig ~= "empty" then
+			lastContentSig = "empty"
+			if pruneGone({}) then
+				pendingResort = true
+				flushResort()
+			end
+		end
+		return
+	end
+
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(body)
+	end)
+	if not ok or type(data) ~= "table" then
+		setStatus(false, "Error")
+		pcall(access.statusFeed, false, 0)
+		return
+	end
+
+	setStatus(true, "Connected")
+	local nowTs = os.time()
+	local alive = {}
+	local parts = {} -- para firma de contenido (ordenado)
+
+	-- 1) Solo parsear / filtrar stale. NO tocar UI todavía.
+	local fresh = {}
+	local fbKeys = {}
+	for fbKey, egg in pairs(data) do
+		if type(egg) == "table" and egg.eggUid and tonumber(egg.placeId) == access.PLACE_ID then
+			local uid = tostring(egg.eggUid)
+			fbKeys[uid] = fbKey
+			local last = tonumber(egg.lastSeen) or 0
+			if (nowTs - last) <= STALE_SEC and not CX.isIgnored(uid) then
+				alive[uid] = true
+				local entry = mapEggToEntry(egg)
+				fresh[uid] = entry
+				parts[#parts + 1] = eggSig(entry)
+			end
+		end
+	end
+	table.sort(parts)
+	local contentSig = table.concat(parts, ";")
+	CX.lastFresh = fresh
+	CX.lastFbKeys = fbKeys
+	aliveNow = alive
+	do
+		local aliveCount = 0
+		for _ in pairs(alive) do aliveCount += 1 end
+		pcall(access.statusFeed, true, aliveCount)
+	end
+
+	-- CLAVE: lastSeen de Firebase cambia cada pocos segundos → el body JSON cambia
+	-- siempre. Antes eso forzaba trabajo de UI aunque no hubiera logs nuevos.
+	-- Ahora comparamos solo uid|mps|mut|name (players va por ticker).
+	if contentSig == lastContentSig then
+		-- Solo sincronizar jugadores en memoria. El ticker pinta 7/# + edad 1 fila/vez.
+		for uid, entry in pairs(fresh) do
+			local ui = entryUi[uid]
+			if ui and ui.data then
+				local op, omp = ui.data.players, ui.data.maxPlayers
+				if op ~= entry.players or omp ~= entry.maxPlayers then
+					ui.data.players = entry.players
+					ui.data.maxPlayers = entry.maxPlayers
+					ui._staticSub = nil -- el próximo paintAgeOnly redibuja 7/# barato
+				end
+			end
+		end
+		return
+	end
+	lastContentSig = contentSig
+
+	local changed = false
+	local newBatch = {}
+
+	for uid, entry in pairs(fresh) do
+		local ui = entryUi[uid]
+		if ui and ui.wrapper and ui.wrapper.Parent then
+			local old = ui.data
+			local same = old and eggSig(old) == eggSig(entry)
+			ui.data = entry
+			entryData[ui.wrapper] = entry
+			if not same then
+				ui._staticSub = subStatic(entry)
+				ui.sub.Text = subText(entry)
+				ui.name.Text = entry.name .. "  [ " .. formatValue(entry.mps) .. " ]"
+				ui.name.TextColor3 = valueColor(entry.mps, entry.og)
+				changed = true
+			end
+		elseif not seenEggs[uid] then
+			pcall(access.statusNew, 1)
+			pcall(access.countLog, fbKeys[uid])
+			seenEggs[uid] = nowTs
+			local secKey = tostring(entry.jobId or "") .. "|" .. tostring(entry.name or "") .. "|" .. tostring(math.floor((entry.mps or 0) / 1e5))
+			if not seenEggs["sec:" .. secKey] then
+				seenEggs["sec:" .. secKey] = nowTs
+				newBatch[#newBatch + 1] = entry
+				changed = true
+			else
+				-- ya vimos un egg "igual" (mismo job/name/tier): no spawnear otra fila
+				seenEggs[uid] = nowTs
+			end
+		end
+	end
+
+	if #newBatch > 0 then
+		table.sort(newBatch, function(x, y)
+			return (tonumber(x.mps) or 0) > (tonumber(y.mps) or 0)
+		end)
+		for _, entry in ipairs(newBatch) do
+			spawnQueue[#spawnQueue + 1] = entry
+		end
+		runQueue()
+	end
+
+	local pruned = pruneGone(alive)
+	if pruned or changed then
+		pendingResort = true
+	end
+	flushResort()
+end
+
+-- Purga cada 5 min (:04:50, :09:50, ... = 10 s ANTES de cada :00 :05 :10):
+-- limpia el feed y borra de Firebase lo que haya quedado, para recibir los logs nuevos en limpio.
+CX.purge = function()
+	if next(entryUi) == nil and next(CX.lastFbKeys) == nil then return end
+	local keys = {}
+	local ts = os.time()
+	for uid, fbKey in pairs(CX.lastFbKeys) do
+		CX.ignored[uid] = ts
+		keys[#keys + 1] = fbKey
+	end
+	for uid in pairs(entryUi) do CX.ignored[uid] = ts end
+	for k in pairs(seenEggs) do
+		if type(k) == "string" and string.find(k, "^sec:") then seenEggs[k] = nil end
+	end
+	table.clear(spawnQueue)
+	CX.lastFresh = {}
+	CX.lastFbKeys = {}
+	lastContentSig = ""
+	CX.clearFeedUi()
+	CX.del(keys)
+end
+
+task.spawn(function()
+	local lastCycle = -1
+	while ScreenGui and ScreenGui.Parent do
+		task.wait(0.5)
+		local t = os.time()
+		local cyc = math.floor(t / 300)
+		if t % 300 >= 290 and lastCycle ~= cyc then
+			lastCycle = cyc
+			pcall(CX.purge)
+		end
+	end
+end)
+
+-- Poll de red. Arranca YA (sin esperas) para que "Connected" salga rapido.
+task.spawn(function()
+	while ScreenGui and ScreenGui.Parent do
+		pcall(fetchEggs)
+		task.wait(POLL)
+	end
+end)
+
+----------------------------------------------------------------
+-- Edad del pet (0:40): 1 fila por tick. NUNCA actualizar todas a la vez.
+----------------------------------------------------------------
+task.spawn(function()
+	local cursor = 1
+	while ScreenGui and ScreenGui.Parent do
+		task.wait(1) -- 1 segundo real (timer fluido, sin saltos)
+		local list = {}
+		for _, ui in pairs(entryUi) do
+			if ui and ui.sub and ui.data and ui.wrapper and ui.wrapper.Parent and ui.wrapper.Visible then
+				list[#list + 1] = ui
+			end
+		end
+		if #list == 0 then
+			cursor = 1
+		else
+			-- Repartir: actualizar HASTA 3 filas por segundo (fluido, coste mínimo)
+			local n = math.min(3, #list)
+			for _ = 1, n do
+				if cursor > #list then cursor = 1 end
+				paintAgeOnly(list[cursor])
+				cursor += 1
+			end
+		end
+	end
+end)
+
+do
+----------------------------------------------------------------
+-- Marcas de CeboScripts: cartel + resaltado sobre los jugadores
+-- del MISMO servidor que tengan el Scanner ejecutado.
+-- SOLO el OWNER las ve. Los whitelistados NO ven banner ni highlight.
+----------------------------------------------------------------
+local TAG_TEXT = "CeboScripts"
+local scannerTags = {} -- userId -> { gui = BillboardGui, hl = Highlight, char = Model }
+
+local function removeTag(uid)
+	local t = scannerTags[uid]
+	if not t then return end
+	scannerTags[uid] = nil
+	pcall(function() if t.gui then t.gui:Destroy() end end)
+	pcall(function() if t.hl then t.hl:Destroy() end end)
+end
+
+local function clearAllTags()
+	for uid in pairs(scannerTags) do removeTag(uid) end
+end
+
+local function applyTag(plr)
+	if not access.canCebo() or not config.viewCebo then return end
+	local char = plr.Character
+	if not char then return end
+	local head = char:FindFirstChild("Head")
+	if not head then return end
+	local cur = scannerTags[plr.UserId]
+	if cur and cur.char == char and cur.gui and cur.gui.Parent then return end
+	removeTag(plr.UserId)
+
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "CeboScriptsTag"
+	gui.Adornee = head
+	gui.AlwaysOnTop = true
+	gui.Size = UDim2.new(0, 130, 0, 26)
+	gui.StudsOffsetWorldSpace = Vector3.new(0, 3.2, 0)
+	gui.MaxDistance = math.huge
+	gui.ResetOnSpawn = false
+	gui.Parent = head
+
+	local bg = Instance.new("Frame")
+	bg.Size = UDim2.new(1, 0, 1, 0)
+	bg.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+	bg.BackgroundTransparency = 0.25
+	bg.BorderSizePixel = 0
+	bg.Parent = gui
+	local bgc = Instance.new("UICorner")
+	bgc.CornerRadius = UDim.new(0, 8)
+	bgc.Parent = bg
+	local st = Instance.new("UIStroke")
+	st.Color = Color3.fromRGB(255, 255, 255)
+	st.Thickness = 1.5
+	st.Parent = bg
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, 0, 1, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = TAG_TEXT
+	lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+	lbl.Font = Enum.Font.GothamBlack
+	lbl.TextScaled = true
+	lbl.Parent = bg
+
+	local hl = Instance.new("Highlight")
+	hl.Name = "CeboScriptsHL"
+	hl.FillColor = Color3.fromRGB(255, 255, 255)
+	hl.FillTransparency = 0.7
+	hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+	hl.OutlineTransparency = 0
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Parent = char
+
+	scannerTags[plr.UserId] = { gui = gui, hl = hl, char = char }
+end
+
+-- Recalcula quién debe tener marca (mismo servidor + scanner activo)
+-- Solo el OWNER ejecuta esto
+updateTags = function()
+	if not access.canCebo() or not config.viewCebo then
+		clearAllTags()
+		return
+	end
+	local want = {}
+	for _, u in pairs(usersData) do
+		local uid = tonumber(u.userId)
+		if uid and uid ~= localPlayer.UserId and tostring(u.jobId or "") == tostring(game.JobId) then
+			local plr = Players:GetPlayerByUserId(uid)
+			if plr then
+				want[uid] = true
+				pcall(applyTag, plr)
+			end
+		end
+	end
+	for uid in pairs(scannerTags) do
+		if not want[uid] then removeTag(uid) end
+	end
+end
+
+-- Solo el owner registra listeners de tags (ahorra trabajo a whitelistados)
+if false then
+	Players.PlayerRemoving:Connect(function(plr) removeTag(plr.UserId) end)
+	local function watchChar(plr)
+		plr.CharacterAdded:Connect(function()
+			task.wait(0.2)
+			if config.viewCebo and usersData[tostring(plr.UserId)] then pcall(updateTags) end
+		end)
+	end
+	for _, plr in ipairs(Players:GetPlayers()) do watchChar(plr) end
+	Players.PlayerAdded:Connect(watchChar)
+	ScreenGui.Destroying:Connect(clearAllTags)
+
+	-- Loop local rapido (1s): no depende del poll de Firebase
+	task.spawn(function()
+		while ScreenGui and ScreenGui.Parent do
+			if config.viewCebo then
+				pcall(updateTags)
+			else
+				clearAllTags()
+			end
+			task.wait(1)
+		end
+	end)
+else
+	updateTags = function() end -- no-op para no-owner
+end
+end
+
+----------------------------------------------------------------
+-- AUTO EXECUTE FINDER: tras cada teleport vuelve a ejecutar el Finder
+-- (misma logica del scanner: guarda el loader en un archivo y lo relanza con queue_on_teleport)
+----------------------------------------------------------------
+do
+	local LOADER_FOLDER = "CeboLibrary"
+	local LOADER_FILE = LOADER_FOLDER .. "/CeboFinderLoader.lua"
+	local LOADER_URL = "https://api.luarmor.net/files/v4/loaders/3bfa39bce217c43f7be19c701aeb50be.lua"
+	local queuedThisRun = false
+
+	local function saveLoader(src)
+		if type(src) ~= "string" or #src < 20 or not writefile then return false end
+		pcall(function()
+			if isfolder and makefolder and not isfolder(LOADER_FOLDER) then makefolder(LOADER_FOLDER) end
+		end)
+		return pcall(function() writefile(LOADER_FILE, src) end)
+	end
+
+	-- 1) script_key de esta ejecucion (lo define el loader de Luarmor) -> se arma el loader completo
+	-- 2) si no hay key, se intenta capturar el source propio (como el scanner)
+	-- 3) si tampoco, se usa el loader ya guardado antes
+	local function captureLoader()
+		local key = nil
+		pcall(function()
+			local env2 = (getgenv and getgenv()) or _G
+			key = env2.script_key or _G.script_key
+		end)
+		if type(key) == "string" and key ~= "" then
+			local src = string.format('script_key=%q; loadstring(game:HttpGet(%q))()', key, LOADER_URL)
+			if saveLoader(src) then return true end
+		end
+		local ok, info = pcall(function() return debug.getinfo and debug.getinfo(1, "S") end)
+		if ok and type(info) == "table" and type(info.source) == "string" then
+			local raw = info.source
+			local src = nil
+			if raw:sub(1, 1) == "=" then
+				src = raw:sub(2)
+			elseif raw:sub(1, 1) == "@" and isfile and readfile and isfile(raw:sub(2)) then
+				src = readfile(raw:sub(2))
+			end
+			if type(src) == "string" and #src > 400 and src:find("CeboFinder_UI", 1, true) then
+				if saveLoader(src) then return true end
+			end
+		end
+		if isfile and isfile(LOADER_FILE) then return true end
+		return false
+	end
+
+	CX.queueAutoExec = function()
+		local q = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+		if not q then return false end
+		if not captureLoader() then return false end
+		if queuedThisRun then return true end
+		queuedThisRun = true
+		local bootstrap = string.format([==[
+			repeat task.wait() until game:IsLoaded()
+			local HttpService = game:GetService("HttpService")
+			local okC, cfg = pcall(function() return HttpService:JSONDecode(readfile("CeboFinder_Config.json")) end)
+			if not (okC and type(cfg) == "table" and cfg.autoExec == true) then return end
+			local okS, src = pcall(function() return readfile(%q) end)
+			if okS and type(src) == "string" and #src > 20 then
+				local fn = loadstring(src)
+				if fn then pcall(fn) end
+			end
+		]==], LOADER_FILE)
+		local okQ = pcall(q, bootstrap)
+		return okQ
+	end
+
+	if config.autoExec then pcall(CX.queueAutoExec) end
+end
+
+----------------------------------------------------------------
+-- IDENTIFICACION: sobre tu cabeza "discord.gg/cebollita".
+-- Los demas que tengan el Finder en TU servidor ven tu avatar azul + "CeboFinder"
+-- (y tu ves el suyo igual). Presencia en Firebase: /finders
+----------------------------------------------------------------
+do
+	local selfId = localPlayer.UserId
+	local FINDER_BLUE = Color3.fromRGB(25, 70, 160)
+	local FINDER_BLUE_LIGHT = Color3.fromRGB(70, 130, 220)
+	local finderUsers = {} -- userId -> true (mismo servidor, presencia reciente)
+	local fTags = {}       -- userId -> { gui, hl, char }
+
+	local function removeFTag(uid)
+		local t = fTags[uid]
+		if not t then return end
+		fTags[uid] = nil
+		pcall(function() if t.gui then t.gui:Destroy() end end)
+		pcall(function() if t.hl then t.hl:Destroy() end end)
+	end
+
+	local function applyFTag(plr, isSelf)
+		local char = plr.Character
+		if not char then return end
+		local head = char:FindFirstChild("Head")
+		if not head then return end
+		local cur = fTags[plr.UserId]
+		if cur and cur.char == char and cur.gui and cur.gui.Parent then return end
+		removeFTag(plr.UserId)
+
+		local gui = Instance.new("BillboardGui")
+		gui.Name = "CeboFinderTag"
+		gui.Adornee = head
+		gui.AlwaysOnTop = true
+		gui.Size = UDim2.new(0, isSelf and 170 or 110, 0, 24)
+		gui.StudsOffsetWorldSpace = Vector3.new(0, 3.2, 0)
+		gui.MaxDistance = math.huge
+		gui.ResetOnSpawn = false
+		gui.Parent = head
+
+		local bg = Instance.new("Frame")
+		bg.Size = UDim2.new(1, 0, 1, 0)
+		bg.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+		bg.BackgroundTransparency = 0.25
+		bg.BorderSizePixel = 0
+		bg.Parent = gui
+		local bgc = Instance.new("UICorner")
+		bgc.CornerRadius = UDim.new(0, 8)
+		bgc.Parent = bg
+		local st = Instance.new("UIStroke")
+		st.Color = isSelf and Color3.fromRGB(255, 255, 255) or FINDER_BLUE_LIGHT
+		st.Thickness = 1.5
+		st.Parent = bg
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1, -8, 1, -4)
+		lbl.Position = UDim2.new(0, 4, 0, 2)
+		lbl.BackgroundTransparency = 1
+		lbl.Text = isSelf and "discord.gg/cebollita" or "CeboFinder"
+		lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+		lbl.Font = Enum.Font.GothamBlack
+		lbl.TextScaled = true
+		lbl.Parent = bg
+
+		local hl = nil
+		if not isSelf then
+			hl = Instance.new("Highlight")
+			hl.Name = "CeboFinderHL"
+			hl.FillColor = FINDER_BLUE
+			hl.FillTransparency = 0.3
+			hl.OutlineColor = FINDER_BLUE_LIGHT
+			hl.OutlineTransparency = 0.2
+			hl.DepthMode = Enum.HighlightDepthMode.Occluded
+			hl.Parent = char
+		end
+		fTags[plr.UserId] = { gui = gui, hl = hl, char = char }
+	end
+
+	local function refreshFTags()
+		local want = {}
+		want[selfId] = true
+		pcall(applyFTag, localPlayer, true)
+		for uid in pairs(finderUsers) do
+			local plr = Players:GetPlayerByUserId(uid)
+			if plr and uid ~= selfId then
+				want[uid] = true
+				pcall(applyFTag, plr, false)
+			end
+		end
+		for uid in pairs(fTags) do
+			if not want[uid] then removeFTag(uid) end
+		end
+	end
+
+	-- Latido de presencia (cada 10 s)
+	task.spawn(function()
+		while ScreenGui and ScreenGui.Parent do
+			pcall(httpSend, "PUT", "/finders/" .. tostring(selfId) .. ".json", {
+				userId = selfId,
+				name = tostring(localPlayer.Name or ""),
+				jobId = tostring(game.JobId or ""),
+				placeId = tonumber(game.PlaceId) or 0,
+				lastSeen = os.time(),
+			})
+			task.wait(10)
+		end
+	end)
+
+	-- Lectura de otros Finders (cada 4 s)
+	task.spawn(function()
+		while ScreenGui and ScreenGui.Parent do
+			local since = os.time() - 40
+			local body = httpGet("/finders.json?orderBy=%22lastSeen%22&startAt=" .. tostring(since) .. "&endAt=%22" .. FEED_SECRET .. "%22")
+			if body and body ~= "" and body ~= "null" and not body:find("\"error\"", 1, true) then
+				local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+				if ok and type(data) == "table" then
+					local nxt = {}
+					for _, u in pairs(data) do
+						if type(u) == "table" then
+							local uid = tonumber(u.userId)
+							if uid and uid ~= selfId and tostring(u.jobId or "") == tostring(game.JobId) then
+								nxt[uid] = true
+							end
+						end
+					end
+					finderUsers = nxt
+				end
+			elseif body == "null" then
+				finderUsers = {}
+			end
+			pcall(refreshFTags)
+			task.wait(4)
+		end
+	end)
+
+	-- Re-aplica rapido (respawn, personajes nuevos)
+	task.spawn(function()
+		while ScreenGui and ScreenGui.Parent do
+			pcall(refreshFTags)
+			task.wait(1)
+		end
+	end)
+
+	ScreenGui.Destroying:Connect(function()
+		for uid in pairs(fTags) do removeFTag(uid) end
+		pcall(function()
+			if requestFn then
+				requestFn({
+					Url = silentUrl(FIREBASE .. "/finders/" .. tostring(selfId) .. ".json"),
+					Method = "DELETE",
+					Headers = { ["Content-Type"] = "application/json" },
+				})
+			end
+		end)
+	end)
+end
+
+setStatus(false, "Conectando...")
+switchTab("Logs")
+pcall(access.applyLock)
+Main.BackgroundTransparency = 1
+UIScale.Scale = 0
+tween(Main, { BackgroundTransparency = 0 }, 0.3)
+tween(UIScale, { Scale = scaleFactor }, 0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+-- Reglas de Firebase: ver el archivo CeboFinder_Reglas_v32.txt (se pegan en Realtime Database > Rules).
